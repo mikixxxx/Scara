@@ -70,7 +70,7 @@ class Rho4:
         self.port = port
         self.timeout = timeout
         self.sock = None
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
 
 
     # =========================================================
@@ -113,17 +113,21 @@ class Rho4:
         data = b""
 
         while len(data) < size:
-
             if self.sock is None:
                 raise ConnectionError("Nejsi pripojen k RHO")
 
             chunk = self.sock.recv(size - len(data))
 
             if not chunk:
-                self.disconnect()
-                raise ConnectionError(
-                    "RHO ukoncilo TCP spojeni"
-                )
+                # _recv_exact() is normally called while _lock is held.
+                # Close the socket directly here instead of calling
+                # disconnect(), which would try to acquire the same lock.
+                try:
+                    self.sock.close()
+                except OSError:
+                    pass
+                self.sock = None
+                raise ConnectionError("RHO ukoncilo TCP spojeni")
 
             data += chunk
 
@@ -305,7 +309,7 @@ class Rho4:
         return True
 
     def wait_move(self, timeout=30.0):
-        # ceka na ukonceni aktualniho PTP pohybu
+        # ceka na ukonceni aktualniho PTP/LINEAR/CIRCULAR pohybu
         # True -> Dokonceno
 
         start_time = time.monotonic()
@@ -322,7 +326,7 @@ class Rho4:
                 last_status = current_status
 
             if state == self.MOVE_ERROR:
-                raise RuntimeError(f"PCMOVE skoncil RC chybou: {error}")
+                raise RuntimeError(f"Pohyb skoncil RC chybou: {error}")
             if state == self.MOVE_STOPPED:
                 return False
             if (state == self.MOVE_DONE and procstatus == -1):
@@ -401,12 +405,13 @@ class Rho4:
 
     def select_target_configuration(self, x, y, z, r):
         valid = self.check_target(x, y, z, r)
-        current_a1, current_a2, _, _ = self.get_joint_position()
+        current_a1, current_a2, _, current_a4 = self.get_joint_position()
 
         def distance(solution):
             da1 = self._angle_delta_deg(solution["a1"], current_a1)
             da2 = self._angle_delta_deg(solution["a2"], current_a2)
-            return da1*da1 + da2*da2
+            da4 = self._angle_delta_deg(solution["a4"], current_a4)
+            return da1*da1 + da2*da2 + da4*da4
 
         return min(valid, key=distance)
 
@@ -420,7 +425,7 @@ class Rho4:
         with self._lock:
             #CMD16
             if self.sock is None:
-                return False
+                raise ConnectionError("Nejsi pripojen k RHO")
             self.sock.sendall(struct.pack("<ifffff",16,float(x),float(y),float(z),float(r),float(speed_mm_s)))
             response = struct.unpack("<i", self._recv_exact(4))[0]
 
@@ -442,64 +447,77 @@ class Rho4:
 
     def get_joint_position(self):
         with self._lock:
-            assert self.sock is not None
+            if self.sock is None:
+                raise ConnectionError("Nejsi pripojen k RHO")
             self.sock.sendall(struct.pack("<i",17))
             data = self._recv_exact(16)
             return struct.unpack("<ffff",data)
 
-    def check_linear_path(self,x,y,z,r,step_mm=2.0, joint_step_limit=10.0):
+    def check_linear_path(
+        self,
+        x, y, z, r,
+        step_mm=2.0,
+        joint_step_limit=10.0,
+        angular_step_deg=5.0
+    ):
         if step_mm <= 0:
             raise ValueError("step_mm musi byt > 0")
-        sx,sy,sz,sr = self.get_position()
-        ca1,ca2,ca3,ca4 = self.get_joint_position()
+        if angular_step_deg <= 0:
+            raise ValueError("angular_step_deg musi byt > 0")
+
+        sx, sy, sz, sr = self.get_position()
+        ca1, ca2, ca3, ca4 = self.get_joint_position()
 
         dx = float(x) - sx
         dy = float(y) - sy
         dz = float(z) - sz
-        dr = self._angle_delta_deg(float(r),sr)
+        dr = self._angle_delta_deg(float(r), sr)
 
         length = math.sqrt(dx*dx + dy*dy + dz*dz)
-        samples = max(1, int(math.ceil(length/step_mm)))
-        previous = {"a1": ca1, "a2": ca2, "a3": ca3, "a4": ca4,}
+        xyz_samples = int(math.ceil(length / step_mm))
+        r_samples = int(math.ceil(abs(dr) / angular_step_deg))
+        samples = max(1, xyz_samples, r_samples)
+
+        previous = {
+            "a1": ca1,
+            "a2": ca2,
+            "a3": ca3,
+            "a4": ca4,
+        }
 
         path = []
-        for i in range(1, samples +1):
-            t = i/samples
-            px = sx + dx *t
+
+        for i in range(1, samples + 1):
+            t = i / samples
+
+            px = sx + dx * t
             py = sy + dy * t
             pz = sz + dz * t
             pr = sr + dr * t
-            solutions = self.check_target(px,py,pz,pr)
+
+            solutions = self.check_target(px, py, pz, pr)
 
             def joint_distance(sol):
-                da1 = self._angle_delta_deg(
-                    sol["a1"],
-                    previous["a1"]
-                )
-
-                da2 = self._angle_delta_deg(
-                    sol["a2"],
-                    previous["a2"]
-                )
-
-                da4 = self._angle_delta_deg(
-                    sol["a4"],
-                    previous["a4"]
-                )
-                return (da1*da1 + da2*da2 + da4*da4)
+                da1 = self._angle_delta_deg(sol["a1"], previous["a1"])
+                da2 = self._angle_delta_deg(sol["a2"], previous["a2"])
+                da4 = self._angle_delta_deg(sol["a4"], previous["a4"])
+                return da1*da1 + da2*da2 + da4*da4
 
             selected = min(solutions, key=joint_distance)
-            da1 = abs(self._angle_delta_deg(selected["a1"],previous["a1"]))
-            da2 = abs(self._angle_delta_deg(selected["a2"],previous["a2"]))
-            da4 = abs(self._angle_delta_deg(selected["a4"],previous["a4"]))
 
-            if max(da1,da2,da4) > joint_step_limit:
-                            raise ValueError(
-                                "LINEAR path: prilis velky skok jointu "
-                                f"v {t*100:.1f}% drahy: "
-                                f"dA1={da1:.2f} "
-                                f"dA2={da2:.2f} "
-                                f"dA4={da4:.2f}")
+            da1 = abs(self._angle_delta_deg(selected["a1"], previous["a1"]))
+            da2 = abs(self._angle_delta_deg(selected["a2"], previous["a2"]))
+            da4 = abs(self._angle_delta_deg(selected["a4"], previous["a4"]))
+
+            if max(da1, da2, da4) > joint_step_limit:
+                raise ValueError(
+                    "LINEAR path: prilis velky skok jointu "
+                    f"v {t*100:.1f}% drahy: "
+                    f"dA1={da1:.2f} "
+                    f"dA2={da2:.2f} "
+                    f"dA4={da4:.2f}"
+                )
+
             point = {
                 "t": t,
                 "x": px,
@@ -509,19 +527,357 @@ class Rho4:
                 "a1": selected["a1"],
                 "a2": selected["a2"],
                 "a3": selected["a3"],
-                "a4": selected["a4"],}
-            
+                "a4": selected["a4"],
+            }
+
             path.append(point)
             previous = selected
+
         return path
-    
-          
+
+    # =========================================================
+    # CIRCULAR GEOMETRY / SAFETY CHECK
+    # =========================================================
+
+    @staticmethod
+    def _v_add(a, b):
+        return (a[0] + b[0], a[1] + b[1], a[2] + b[2])
+
+    @staticmethod
+    def _v_sub(a, b):
+        return (a[0] - b[0], a[1] - b[1], a[2] - b[2])
+
+    @staticmethod
+    def _v_scale(a, k):
+        return (a[0] * k, a[1] * k, a[2] * k)
+
+    @staticmethod
+    def _v_dot(a, b):
+        return a[0]*b[0] + a[1]*b[1] + a[2]*b[2]
+
+    @staticmethod
+    def _v_cross(a, b):
+        return (
+            a[1]*b[2] - a[2]*b[1],
+            a[2]*b[0] - a[0]*b[2],
+            a[0]*b[1] - a[1]*b[0],
+        )
+
+    @classmethod
+    def _v_norm(cls, a):
+        return math.sqrt(cls._v_dot(a, a))
+
+    @classmethod
+    def _circle_geometry(cls, start, mid, end):
+        """
+        Circle through START/MID/END in XYZ.
+
+        Returns:
+            center, radius, e1, e2, start_angle, sweep, mid_fraction
+        """
+        p0 = tuple(float(v) for v in start[:3])
+        p1 = tuple(float(v) for v in mid[:3])
+        p2 = tuple(float(v) for v in end[:3])
+
+        v1 = cls._v_sub(p1, p0)
+        v2 = cls._v_sub(p2, p0)
+        len1 = cls._v_norm(v1)
+        len2 = cls._v_norm(v2)
+
+        if len1 < 1e-9:
+            raise ValueError("CIRCULAR: MID je shodny se START")
+        if len2 < 1e-9:
+            raise ValueError(
+                "CIRCULAR: END je shodny se START; "
+                "celou kruznici rozdel na dva oblouky"
+            )
+
+        normal_raw = cls._v_cross(v1, v2)
+        normal_len = cls._v_norm(normal_raw)
+
+        if normal_len < 1e-9 * max(1.0, len1 * len2):
+            raise ValueError("CIRCULAR: START, MID a END lezi na primce")
+
+        e1 = cls._v_scale(v1, 1.0 / len1)
+        normal = cls._v_scale(normal_raw, 1.0 / normal_len)
+        e2 = cls._v_cross(normal, e1)
+
+        # Local plane:
+        # START=(0,0), MID=(x1,0), END=(x2,y2)
+        x1 = len1
+        x2 = cls._v_dot(v2, e1)
+        y2 = cls._v_dot(v2, e2)
+
+        if abs(y2) < 1e-9:
+            raise ValueError("CIRCULAR: body nedefinuji kruznici")
+
+        center_u = x1 * 0.5
+        center_v = (
+            x2*x2 + y2*y2 - 2.0*center_u*x2
+        ) / (2.0*y2)
+
+        center = cls._v_add(
+            p0,
+            cls._v_add(
+                cls._v_scale(e1, center_u),
+                cls._v_scale(e2, center_v)
+            )
+        )
+
+        radius = math.hypot(center_u, center_v)
+
+        if radius < 1e-9 or not math.isfinite(radius):
+            raise ValueError("CIRCULAR: neplatny polomer")
+
+        def angle_of(point):
+            rel = cls._v_sub(
+                tuple(float(v) for v in point[:3]),
+                center
+            )
+            return math.atan2(
+                cls._v_dot(rel, e2),
+                cls._v_dot(rel, e1)
+            )
+
+        a_start = angle_of(start)
+        a_mid = angle_of(mid)
+        a_end = angle_of(end)
+
+        tau = 2.0 * math.pi
+        ccw_total = (a_end - a_start) % tau
+        ccw_mid = (a_mid - a_start) % tau
+
+        if ccw_total < 1e-10:
+            raise ValueError(
+                "CIRCULAR: START a END jsou shodne; "
+                "celou kruznici rozdel na dva oblouky"
+            )
+
+        if ccw_mid <= ccw_total + 1e-10:
+            sweep = ccw_total
+            mid_sweep = ccw_mid
+        else:
+            sweep = -((a_start - a_end) % tau)
+            mid_sweep = -((a_start - a_mid) % tau)
+
+        if abs(sweep) < 1e-10:
+            raise ValueError("CIRCULAR: nulovy uhel oblouku")
+
+        mid_fraction = mid_sweep / sweep
+
+        if not (0.0 < mid_fraction < 1.0):
+            raise ValueError("CIRCULAR: MID nelezi uvnitr vybraneho oblouku")
+
+        return (
+            center,
+            radius,
+            e1,
+            e2,
+            a_start,
+            sweep,
+            mid_fraction,
+        )
+
+    @classmethod
+    def _circular_xyz(cls, geometry, u):
+        center, radius, e1, e2, a_start, sweep, _ = geometry
+        angle = a_start + sweep * u
+        radial = cls._v_add(
+            cls._v_scale(e1, radius * math.cos(angle)),
+            cls._v_scale(e2, radius * math.sin(angle))
+        )
+        return cls._v_add(center, radial)
+
+    def check_circular_path(
+        self,
+        mid_x, mid_y, mid_z, mid_r,
+        end_x, end_y, end_z, end_r,
+        step_mm=2.0,
+        joint_step_limit=10.0,
+        angular_step_deg=5.0
+    ):
+        """
+        Dry-run safety check for CIRCULAR.
+
+        Geometry is sampled along the complete START->MID->END arc.
+        R is conservatively sampled through START_R -> MID_R -> END_R.
+        """
+        if step_mm <= 0:
+            raise ValueError("step_mm musi byt > 0")
+        if angular_step_deg <= 0:
+            raise ValueError("angular_step_deg musi byt > 0")
+
+        sx, sy, sz, sr = self.get_position()
+        ca1, ca2, ca3, ca4 = self.get_joint_position()
+
+        start = (sx, sy, sz, sr)
+        mid = (
+            float(mid_x), float(mid_y),
+            float(mid_z), float(mid_r)
+        )
+        end = (
+            float(end_x), float(end_y),
+            float(end_z), float(end_r)
+        )
+
+        geometry = self._circle_geometry(start, mid, end)
+        radius = geometry[1]
+        sweep = geometry[5]
+        mid_fraction = geometry[6]
+
+        arc_length = abs(sweep) * radius
+
+        dr1 = self._angle_delta_deg(mid[3], sr)
+        mid_r_unwrapped = sr + dr1
+        dr2 = self._angle_delta_deg(end[3], mid_r_unwrapped)
+
+        xyz_samples = int(math.ceil(arc_length / step_mm))
+        r_samples = int(
+            math.ceil((abs(dr1) + abs(dr2)) / angular_step_deg)
+        )
+        samples = max(1, xyz_samples, r_samples)
+
+        # Include MID exactly even when it does not fall on the regular grid.
+        u_values = {i / samples for i in range(1, samples + 1)}
+        u_values.add(mid_fraction)
+        u_values = sorted(u_values)
+
+        previous = {
+            "a1": ca1,
+            "a2": ca2,
+            "a3": ca3,
+            "a4": ca4,
+        }
+
+        path = []
+
+        for u in u_values:
+            px, py, pz = self._circular_xyz(geometry, u)
+
+            if u <= mid_fraction:
+                local = u / mid_fraction
+                pr = sr + dr1 * local
+            else:
+                local = (u - mid_fraction) / (1.0 - mid_fraction)
+                pr = mid_r_unwrapped + dr2 * local
+
+            solutions = self.check_target(px, py, pz, pr)
+
+            def joint_distance(sol):
+                da1 = self._angle_delta_deg(sol["a1"], previous["a1"])
+                da2 = self._angle_delta_deg(sol["a2"], previous["a2"])
+                da4 = self._angle_delta_deg(sol["a4"], previous["a4"])
+                return da1*da1 + da2*da2 + da4*da4
+
+            selected = min(solutions, key=joint_distance)
+
+            da1 = abs(self._angle_delta_deg(
+                selected["a1"], previous["a1"]
+            ))
+            da2 = abs(self._angle_delta_deg(
+                selected["a2"], previous["a2"]
+            ))
+            da4 = abs(self._angle_delta_deg(
+                selected["a4"], previous["a4"]
+            ))
+
+            if max(da1, da2, da4) > joint_step_limit:
+                raise ValueError(
+                    "CIRCULAR path: prilis velky skok jointu "
+                    f"v {u*100:.1f}% drahy: "
+                    f"dA1={da1:.2f} "
+                    f"dA2={da2:.2f} "
+                    f"dA4={da4:.2f}"
+                )
+
+            point = {
+                "t": u,
+                "x": px,
+                "y": py,
+                "z": pz,
+                "r": pr,
+                "a1": selected["a1"],
+                "a2": selected["a2"],
+                "a3": selected["a3"],
+                "a4": selected["a4"],
+            }
+
+            path.append(point)
+            previous = selected
+
+        return path
+
+    def start_circular(
+        self,
+        mid_x, mid_y, mid_z, mid_r,
+        end_x, end_y, end_z, end_r,
+        speed_mm_s=10.0
+    ):
+        if speed_mm_s <= 0:
+            raise ValueError("CIRCULAR speed musi byt > 0 mm/s")
+
+        # Client-side dry-run.  This is an additional guard; native RHO4
+        # travel limits remain authoritative.
+        self.check_circular_path(
+            mid_x, mid_y, mid_z, mid_r,
+            end_x, end_y, end_z, end_r,
+            step_mm=2.0
+        )
+
+        payload = struct.pack(
+            "<ifffffffff",
+            18,
+            float(mid_x),
+            float(mid_y),
+            float(mid_z),
+            float(mid_r),
+            float(end_x),
+            float(end_y),
+            float(end_z),
+            float(end_r),
+            float(speed_mm_s)
+        )
+
+        with self._lock:
+            if self.sock is None:
+                raise ConnectionError("Nejsi pripojen k RHO")
+
+            self.sock.sendall(payload)
+            response = struct.unpack(
+                "<i",
+                self._recv_exact(4)
+            )[0]
+
+        if response == self.START_OK:
+            return True
+
+        if response == self.START_MANUAL:
+            raise RuntimeError("Robot neni v AUTO")
+
+        if response == self.START_BUSY:
+            raise RuntimeError("Predchozi pohyb jeste probiha")
+
+        if response == self.START_RC_ERROR:
+            state, error, procstatus = self.get_move_state()
+            raise RuntimeError(
+                f"CIRCULAR RC error: {error} "
+                f"(ProcStatus={procstatus})"
+            )
+
+        raise RuntimeError(
+            f"Neznama odpoved z CMD18: {response}"
+        )
+
     # =========================================================
     # HIGH LEVEL LINEAR MOVE
     # =========================================================
     
     def move_linear(self,x,y,z,r,speed_mm_s=10.0,timeout=30.0):
         self.start_linear(x,y,z,r,speed_mm_s=speed_mm_s)
+        return self.wait_move(timeout=timeout)
+
+    def move_circular(self,mid_x, mid_y, mid_z, mid_r,end_x, end_y, end_z, end_r,speed_mm_s=10.0,timeout=30.0):
+        self.start_circular(mid_x, mid_y, mid_z, mid_r,end_x, end_y, end_z, end_r,speed_mm_s)
         return self.wait_move(timeout=timeout)
 
 
@@ -575,125 +931,3 @@ class Rho4:
     def jog_stop(self):
         return self.stop()
 
-
-
-    # def move_ptp(self, x, y, z, r, speed=2.0, timeout=30.0):
-    #     # -----------------------------------------------------
-    #     # Nastavime rychlost
-    #     # -----------------------------------------------------
-
-    #     self.set_ptp_speed(speed)
-
-    #     # -----------------------------------------------------
-    #     # Posleme cilovou pozici
-    #     # -----------------------------------------------------
-
-    #     target = self.set_target(x, y, z, r)
-
-    #     # -----------------------------------------------------
-    #     # Spustime PCMOVE
-    #     # -----------------------------------------------------
-
-    #     response = self.start_pcmove()
-
-
-    #     # MANUAL
-    #     if response == self.START_MANUAL:
-    #         raise RuntimeError(
-    #             "Robot je v MANUAL rezimu"
-    #         )
-
-
-    #     # BUSY
-    #     if response == self.START_BUSY:
-    #         raise RuntimeError(
-    #             "Robot uz provadi pohyb"
-    #         )
-
-
-    #     # PCMOVE uz je v RC ERROR
-    #     if response == self.START_RC_ERROR:
-
-    #         state, error, procstatus = (
-    #             self.get_move_state()
-    #         )
-
-    #         raise RuntimeError(
-    #             f"PCMOVE je v RC error: "
-    #             f"{error} "
-    #             f"(ProcStatus={procstatus})"
-    #         )
-
-
-    #     # Neznama odpoved
-    #     if response != self.START_OK:
-    #         raise RuntimeError(
-    #             f"Chyba pri startu PCMOVE: "
-    #             f"{response}"
-    #         )
-
-
-    #     # -----------------------------------------------------
-    #     # Cekame na dokonceni
-    #     # -----------------------------------------------------
-
-    #     start_time = time.monotonic()
-    #     last_status = None
-    #     while True:
-
-    #         state, error, procstatus = (self.get_move_state())
-    #         current_status = (state, error, procstatus)
-    #         if current_status != last_status:
-    #             last_status = current_status
-    #             print(
-    #                 f"State={state}, "
-    #                 f"Error={error}, "
-    #                 f"ProcStatus={procstatus}")
-    #             last_status = current_status
-
-    #         # ---------------------------------------------
-    #         # RC ERROR
-    #         # ---------------------------------------------
-
-    #         if state == self.MOVE_ERROR:
-
-    #             raise RuntimeError(
-    #                 f"PCMOVE skoncil RC chybou: "
-    #                 f"{error}"
-    #             )
-
-
-    #         # ---------------------------------------------
-    #         # HOTOVO
-    #         #
-    #         # Overene experimentem:
-    #         #
-    #         # State=2 ProcStatus=1
-    #         #   jeste neni definitivni vysledek
-    #         #
-    #         # State=2 ProcStatus=-1
-    #         #   normalni konec PCMOVE
-    #         # ---------------------------------------------
-
-    #         if (
-    #             state == self.MOVE_DONE
-    #             and procstatus == -1
-    #         ):
-    #             return True
-
-
-    #         # ---------------------------------------------
-    #         # TIMEOUT
-    #         # ---------------------------------------------
-
-    #         if (
-    #             time.monotonic() - start_time
-    #             > timeout
-    #         ):
-    #             raise TimeoutError(
-    #                 "Robot nedokoncil pohyb "
-    #                 "v casovem limitu"
-    #             )
-
-
-    #         time.sleep(0.05)

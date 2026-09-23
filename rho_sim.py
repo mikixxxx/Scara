@@ -4,6 +4,7 @@ import threading
 import time
 import math
 import tkinter as tk
+from collections import deque
 
 HOST = "127.0.0.1"
 PORT = 6051
@@ -42,6 +43,7 @@ position = [300.0, 300.0, 180.0, 0.0]
 target = position.copy()
 ptp_speed_factor = 0.02       # driver sends speed / 100
 linear_speed_mm_s = 10.0      # CMD16 speed, mm/s
+circular_speed_mm_s = 10.0    # CMD18 speed, mm/s
 
 automatic = True
 alarm = False
@@ -56,6 +58,10 @@ procstatus = -1
 
 stop_requested = False
 shutdown_requested = False
+
+# Actual TCP path trace for the GUI. Bounded for long G-code jobs.
+trajectory = deque(maxlen=10000)
+TRACE_MIN_DISTANCE_MM = 0.5
 
 
 def inverse_xy(x, y):
@@ -125,6 +131,152 @@ def get_joint_position():
     return a1, a2, p[2], p[3] - a1 - a2
 
 
+def _angle_delta_deg(a, b):
+    return (a - b + 180.0) % 360.0 - 180.0
+
+
+def _v_add(a, b):
+    return (a[0] + b[0], a[1] + b[1], a[2] + b[2])
+
+
+def _v_sub(a, b):
+    return (a[0] - b[0], a[1] - b[1], a[2] - b[2])
+
+
+def _v_scale(v, k):
+    return (v[0] * k, v[1] * k, v[2] * k)
+
+
+def _v_dot(a, b):
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+
+
+def _v_cross(a, b):
+    return (
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    )
+
+
+def _v_norm(v):
+    return math.sqrt(_v_dot(v, v))
+
+
+def circle_from_3_points_3d(start, mid, end):
+    """Return center, radius and local basis for a circle through 3 XYZ points."""
+    p0 = tuple(float(v) for v in start[:3])
+    p1 = tuple(float(v) for v in mid[:3])
+    p2 = tuple(float(v) for v in end[:3])
+
+    v1 = _v_sub(p1, p0)
+    v2 = _v_sub(p2, p0)
+    len1 = _v_norm(v1)
+    len2 = _v_norm(v2)
+
+    if len1 < 1e-9:
+        raise ValueError("CIRCULAR: MID je shodny se START")
+    if len2 < 1e-9:
+        raise ValueError("CIRCULAR: END je shodny se START; pouzij dva oblouky")
+
+    normal_raw = _v_cross(v1, v2)
+    normal_len = _v_norm(normal_raw)
+    if normal_len < 1e-9 * max(1.0, len1 * len2):
+        raise ValueError("CIRCULAR: START, MID a END lezi na primce")
+
+    e1 = _v_scale(v1, 1.0 / len1)
+    normal = _v_scale(normal_raw, 1.0 / normal_len)
+    e2 = _v_cross(normal, e1)
+
+    # Plane coordinates: START=(0,0), MID=(x1,0), END=(x2,y2)
+    x1 = len1
+    x2 = _v_dot(v2, e1)
+    y2 = _v_dot(v2, e2)
+    if abs(y2) < 1e-9:
+        raise ValueError("CIRCULAR: body nedefinuji kruznici")
+
+    center_u = x1 * 0.5
+    center_v = (x2*x2 + y2*y2 - 2.0*center_u*x2) / (2.0*y2)
+
+    center = _v_add(
+        p0,
+        _v_add(_v_scale(e1, center_u), _v_scale(e2, center_v))
+    )
+    radius = math.hypot(center_u, center_v)
+
+    if radius < 1e-9 or not math.isfinite(radius):
+        raise ValueError("CIRCULAR: neplatny polomer")
+
+    return center, radius, e1, e2
+
+
+def _circle_angle(point, center, e1, e2):
+    rel = _v_sub(tuple(float(v) for v in point[:3]), center)
+    return math.atan2(_v_dot(rel, e2), _v_dot(rel, e1))
+
+
+def circular_sweep(start_angle, mid_angle, end_angle):
+    """Signed sweep START->END that passes through MID."""
+    tau = 2.0 * math.pi
+    ccw_total = (end_angle - start_angle) % tau
+    ccw_mid = (mid_angle - start_angle) % tau
+
+    if ccw_total < 1e-10:
+        raise ValueError("CIRCULAR: START a END jsou shodne; pouzij dva pulkruhy")
+
+    if ccw_mid <= ccw_total + 1e-10:
+        return ccw_total
+
+    return -((start_angle - end_angle) % tau)
+
+
+def circular_geometry(start, mid, end):
+    center, radius, e1, e2 = circle_from_3_points_3d(start, mid, end)
+    a_start = _circle_angle(start, center, e1, e2)
+    a_mid = _circle_angle(mid, center, e1, e2)
+    a_end = _circle_angle(end, center, e1, e2)
+    sweep = circular_sweep(a_start, a_mid, a_end)
+    return center, radius, e1, e2, a_start, sweep
+
+
+def circular_point(geometry, u):
+    """Return XYZ point on a precomputed arc, u=0..1."""
+    center, radius, e1, e2, a_start, sweep = geometry
+    angle = a_start + sweep * u
+    radial = _v_add(
+        _v_scale(e1, radius * math.cos(angle)),
+        _v_scale(e2, radius * math.sin(angle))
+    )
+    return _v_add(center, radial)
+
+
+def validate_circular_xy_path(geometry, step_mm=2.0):
+    """Sample the complete arc against the simulator's A1/A2 XY limits."""
+    radius = geometry[1]
+    sweep = geometry[5]
+    arc_length = abs(sweep) * radius
+    samples = max(1, int(math.ceil(arc_length / max(step_mm, 0.1))))
+
+    for i in range(samples + 1):
+        xyz = circular_point(geometry, i / samples)
+        if not xy_reachable(xyz[0], xyz[1]):
+            raise ValueError(
+                f"CIRCULAR path unreachable at {i/samples*100.0:.1f}%: "
+                f"X={xyz[0]:.3f} Y={xyz[1]:.3f}"
+            )
+
+
+def _record_trace_unlocked(p):
+    """Append current XY to trace. Caller must hold lock."""
+    xy = (float(p[0]), float(p[1]))
+    if not trajectory:
+        trajectory.append(xy)
+        return
+
+    if math.hypot(xy[0]-trajectory[-1][0], xy[1]-trajectory[-1][1]) >= TRACE_MIN_DISTANCE_MM:
+        trajectory.append(xy)
+
+
 def recv_exact(sock, size):
     data = b""
     while len(data) < size:
@@ -143,21 +295,12 @@ def set_move_state(state, error=0, proc=-1):
         procstatus = proc
 
 
-def motion_worker():
-    global position, in_position, stop_requested
-
-    with lock:
-        start = position.copy()
-        dest = target.copy()
-        speed_factor = max(0.0001, ptp_speed_factor)
-        stop_requested = False
-        in_position = False
-        set_move_state(MOVE_RUNNING, 0, 1)
+def motion_worker(start, dest, speed_factor):
+    global position, in_position
 
     # This is intentionally not a physical RHO4 velocity model.
-    # It only provides deterministic motion in time for driver testing.
     max_delta = max(abs(dest[i] - start[i]) for i in range(4))
-    velocity = 1000.0 * speed_factor   # mm/s or deg/s-ish
+    velocity = 1000.0 * speed_factor
     duration = max(0.15, max_delta / max(velocity, 1.0))
     t0 = time.monotonic()
 
@@ -168,60 +311,58 @@ def motion_worker():
                 set_move_state(MOVE_STOPPED, 0, -1)
                 return
 
-        elapsed = time.monotonic() - t0
-        u = min(1.0, elapsed / duration)
-
-        # smoothstep interpolation
-        s = u * u * (3.0 - 2.0 * u)
+        u = min(1.0, (time.monotonic() - t0) / duration)
+        s = u*u*(3.0 - 2.0*u)
 
         with lock:
             position = [
                 start[i] + (dest[i] - start[i]) * s
                 for i in range(4)
             ]
+            _record_trace_unlocked(position)
 
         if u >= 1.0:
             break
-
         time.sleep(0.01)
 
     with lock:
         position = dest.copy()
+        _record_trace_unlocked(position)
         in_position = True
-
-        # Real driver waits specifically for state=2, procstatus=-1.
         set_move_state(MOVE_DONE, 0, -1)
 
 
 def start_motion():
-    global stop_requested
+    global stop_requested, in_position
 
     with lock:
         if not automatic:
             return START_MANUAL
-
         if move_state == MOVE_RUNNING:
             return START_BUSY
-
         if move_state == MOVE_ERROR:
             return START_RC_ERROR
-
         if alarm:
-            # Simulator-specific RC-like error
             set_move_state(MOVE_ERROR, 144384, 144384)
             return START_RC_ERROR
-
         if not xy_reachable(target[0], target[1]):
             set_move_state(MOVE_ERROR, TRAVEL_RANGE_ERROR, TRAVEL_RANGE_ERROR)
-            print(
-                f"[LIMIT] XY target unreachable: "
-                f"X={target[0]:.3f} Y={target[1]:.3f}"
-            )
+            print(f"[LIMIT] XY target unreachable: X={target[0]:.3f} Y={target[1]:.3f}")
             return START_RC_ERROR
 
+        start = position.copy()
+        dest = target.copy()
+        speed_factor = max(0.0001, ptp_speed_factor)
         stop_requested = False
+        in_position = False
+        set_move_state(MOVE_RUNNING, 0, 1)
+        _record_trace_unlocked(start)
 
-    threading.Thread(target=motion_worker, daemon=True).start()
+    threading.Thread(
+        target=motion_worker,
+        args=(start, dest, speed_factor),
+        daemon=True
+    ).start()
     return START_OK
 
 
@@ -233,13 +374,10 @@ def linear_motion_worker(dest, speed_mm_s):
     with the move. smoothstep only changes acceleration/deceleration;
     the geometric path remains a straight line.
     """
-    global position, in_position, stop_requested
+    global position, in_position
 
     with lock:
         start = position.copy()
-        stop_requested = False
-        in_position = False
-        set_move_state(MOVE_RUNNING, 0, 1)
 
     dx = dest[0] - start[0]
     dy = dest[1] - start[1]
@@ -270,6 +408,7 @@ def linear_motion_worker(dest, speed_mm_s):
                 start[i] + (dest[i] - start[i]) * s
                 for i in range(4)
             ]
+            _record_trace_unlocked(position)
 
         if u >= 1.0:
             break
@@ -278,54 +417,128 @@ def linear_motion_worker(dest, speed_mm_s):
 
     with lock:
         position = dest.copy()
+        _record_trace_unlocked(position)
         in_position = True
         set_move_state(MOVE_DONE, 0, -1)
 
 
 def start_linear_motion(dest, speed_mm_s):
-    global stop_requested, target, linear_speed_mm_s
+    global stop_requested, target, linear_speed_mm_s, in_position
 
     with lock:
         if not automatic:
             return START_MANUAL
-
         if move_state == MOVE_RUNNING:
             return START_BUSY
-
         if move_state == MOVE_ERROR:
             return START_RC_ERROR
-
         if alarm:
             set_move_state(MOVE_ERROR, 144384, 144384)
             return START_RC_ERROR
-
         if speed_mm_s <= 0.0:
             print(f"[LINEAR] Invalid speed: {speed_mm_s}")
             return START_RC_ERROR
-
         if not xy_reachable(dest[0], dest[1]):
             set_move_state(MOVE_ERROR, TRAVEL_RANGE_ERROR, TRAVEL_RANGE_ERROR)
-            print(
-                f"[LIMIT] LINEAR target unreachable: "
-                f"X={dest[0]:.3f} Y={dest[1]:.3f}"
-            )
+            print(f"[LIMIT] LINEAR target unreachable: X={dest[0]:.3f} Y={dest[1]:.3f}")
             return START_RC_ERROR
 
         target = list(dest)
         linear_speed_mm_s = float(speed_mm_s)
         stop_requested = False
+        in_position = False
+        set_move_state(MOVE_RUNNING, 0, 1)
+        _record_trace_unlocked(position)
 
     threading.Thread(
         target=linear_motion_worker,
         args=(list(dest), float(speed_mm_s)),
         daemon=True
     ).start()
+    return START_OK
 
+
+def circular_motion_worker(start, dest, speed_mm_s, geometry):
+    """Simulated native CIRCULAR move through START -> MID -> END."""
+    global position, in_position
+
+    radius = geometry[1]
+    sweep = geometry[5]
+    arc_length = abs(sweep) * radius
+    duration = max(0.15, arc_length / max(0.1, float(speed_mm_s)))
+    dr = _angle_delta_deg(dest[3], start[3])
+    t0 = time.monotonic()
+
+    while True:
+        with lock:
+            if stop_requested:
+                in_position = False
+                set_move_state(MOVE_STOPPED, 0, -1)
+                return
+
+        u = min(1.0, (time.monotonic() - t0) / duration)
+        s = u*u*(3.0 - 2.0*u)
+        xyz = circular_point(geometry, s)
+        r = start[3] + dr*s
+
+        with lock:
+            position = [xyz[0], xyz[1], xyz[2], r]
+            _record_trace_unlocked(position)
+
+        if u >= 1.0:
+            break
+        time.sleep(0.01)
+
+    with lock:
+        position = list(dest)
+        _record_trace_unlocked(position)
+        in_position = True
+        set_move_state(MOVE_DONE, 0, -1)
+
+
+def start_circular_motion(mid, dest, speed_mm_s):
+    global stop_requested, target, circular_speed_mm_s, in_position
+
+    with lock:
+        if not automatic:
+            return START_MANUAL
+        if move_state == MOVE_RUNNING:
+            return START_BUSY
+        if move_state == MOVE_ERROR:
+            return START_RC_ERROR
+        if alarm:
+            set_move_state(MOVE_ERROR, 144384, 144384)
+            return START_RC_ERROR
+        if speed_mm_s <= 0.0:
+            print(f"[CIRCULAR] Invalid speed: {speed_mm_s}")
+            return START_RC_ERROR
+
+        start = position.copy()
+        try:
+            geometry = circular_geometry(start, mid, dest)
+            validate_circular_xy_path(geometry, step_mm=2.0)
+        except ValueError as exc:
+            set_move_state(MOVE_ERROR, TRAVEL_RANGE_ERROR, TRAVEL_RANGE_ERROR)
+            print(f"[CIRCULAR] {exc}")
+            return START_RC_ERROR
+
+        target = list(dest)
+        circular_speed_mm_s = float(speed_mm_s)
+        stop_requested = False
+        in_position = False
+        set_move_state(MOVE_RUNNING, 0, 1)
+        _record_trace_unlocked(start)
+
+    threading.Thread(
+        target=circular_motion_worker,
+        args=(start, list(dest), float(speed_mm_s), geometry),
+        daemon=True
+    ).start()
     return START_OK
 
 
 def handle_client(conn, addr):
-    global target, ptp_speed_factor, linear_speed_mm_s
+    global target, ptp_speed_factor, linear_speed_mm_s, circular_speed_mm_s
     global move_state, move_error, procstatus
     global stop_requested
 
@@ -405,7 +618,7 @@ def handle_client(conn, addr):
             elif cmd == 15:
                 with lock:
                     stop_requested = True
-                print("[PCMOVE] STOP")
+                print("[MOVE] STOP")
                 conn.sendall(struct.pack("<i", 15))
 
             # CMD 16 - START LINEAR
@@ -445,6 +658,24 @@ def handle_client(conn, addr):
                     print(f"[JOINT] {e}")
                     conn.sendall(struct.pack("<ffff", float("nan"), float("nan"), float("nan"), float("nan")))
 
+            # CMD 18 - START CIRCULAR
+            # Payload: MID X,Y,Z,R + END X,Y,Z,R + speed_mm_s = 9 float32
+            elif cmd == 18:
+                data = recv_exact(conn, 36)
+                values = struct.unpack("<fffffffff", data)
+                mid = list(values[0:4])
+                dest = list(values[4:8])
+                speed_mm_s = values[8]
+
+                response = start_circular_motion(mid, dest, speed_mm_s)
+                print(
+                    "[CIRCULAR] "
+                    f"MID=({mid[0]:.3f},{mid[1]:.3f},{mid[2]:.3f},{mid[3]:.3f}) "
+                    f"END=({dest[0]:.3f},{dest[1]:.3f},{dest[2]:.3f},{dest[3]:.3f}) "
+                    f"V={speed_mm_s:.3f} mm/s -> {response}"
+                )
+                conn.sendall(struct.pack("<i", response))
+
             else:
                 print(f"[WARN] Unknown command: {cmd}")
                 # Do not send an arbitrary reply: the real protocol has
@@ -475,6 +706,7 @@ Simulator console:
   pos
   setpos X Y Z R
   state
+  cleartrace
   help
 """)
 
@@ -531,10 +763,14 @@ Simulator console:
                         f"alarm={alarm}, referenced={referenced}"
                     )
 
+                elif cmd == "cleartrace":
+                    trajectory.clear()
+                    print("Trajectory cleared")
+
                 elif cmd == "help":
                     print(
                         "auto 0|1, alarm 0|1, ref 0|1, error N, clear, "
-                        "pos, setpos X Y Z R, state"
+                        "pos, setpos X Y Z R, state, cleartrace"
                     )
 
                 else:
@@ -548,7 +784,7 @@ class SimulatorView:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("Bosch Rexroth SR6 - RHO4 Simulator")
-        self.root.geometry("820x760")
+        self.root.geometry("820x805")
         self.root.resizable(False,False)
 
         self.canvas = tk.Canvas(
@@ -560,6 +796,10 @@ class SimulatorView:
             highlightbackground="#777"
         )
         self.canvas.pack(padx=20, pady=(20, 8))
+
+        controls = tk.Frame(self.root)
+        controls.pack(fill="x", padx=20, pady=(0, 6))
+        tk.Button(controls, text="Clear trace", command=self.clear_trace).pack(side="left")
 
         self.info = tk.Label(
             self.root,
@@ -576,6 +816,10 @@ class SimulatorView:
 
     def on_close(self):
         self.root.destroy()
+
+    def clear_trace(self):
+        with lock:
+            trajectory.clear()
 
     def world_to_canvas(self, x, y):
         # Base in the middle. Mathematical +Y is drawn upward.
@@ -657,12 +901,21 @@ class SimulatorView:
             proc = procstatus
             speed = ptp_speed_factor
             lin_speed = linear_speed_mm_s
+            circ_speed = circular_speed_mm_s
+            trace = list(trajectory)
             auto = automatic
             alm = alarm
             ref = referenced
 
         self.canvas.delete("all")
         self.draw_workspace()
+
+        if len(trace) >= 2:
+            coords = []
+            for x, y in trace:
+                cx, cy = self.world_to_canvas(x, y)
+                coords.extend((cx, cy))
+            self.canvas.create_line(*coords, fill="#0ea5e9", width=2)
 
         ik = choose_ik_solution(p[0], p[1], self.last_ik)
         if ik is not None:
@@ -699,8 +952,9 @@ class SimulatorView:
                 f"{'OK' if target_ok else 'UNREACHABLE'}\n"
                 f"STATE={state}  ERROR={err}  PROC={proc}  "
                 f"PTP={speed*100.0:.2f}%  LIN={lin_speed:.2f} mm/s  "
+                f"CIRC={circ_speed:.2f} mm/s  "
                 f"AUTO={int(auto)} ALARM={int(alm)} REF={int(ref)}\n"
-                f"A1 limit check: {'ON' if CHECK_A1_LIMIT else 'OFF'}  CMD17: ON"
+                f"A1 limit check: {'ON' if CHECK_A1_LIMIT else 'OFF'}  CMD17: ON  CMD18: ON"
             )
         )
 

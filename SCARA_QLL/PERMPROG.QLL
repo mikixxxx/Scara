@@ -476,33 +476,40 @@ END
 
         READ WIN_1,CIRC_SPEED
 
-        IF AUTO_RC=0 THEN
-        BEGIN
-            RESPONSE=-10
-        END
-        ELSE
-        BEGIN
-            IF MOVE_STATE=1 THEN
-            BEGIN
-                RESPONSE=-11
-            END
-            ELSE
-            BEGIN
-                PROCSTATUS=CONDITION(PCCIRC)
+        RESPONSE=0
+        PROCSTATUS=CONDITION(PCCIRC)
 
-                IF PROCSTATUS>100 THEN
+        ; PCCIRC je v RC error
+        IF PROCSTATUS>100 THEN
+        BEGIN
+            MOVE_STATE=3
+            MOVE_ERROR=PROCSTATUS
+            RESPONSE=-12
+        END
+
+        IF PROCSTATUS<=100 THEN
+        BEGIN
+            IF AUTO_RC=0 THEN
+            BEGIN
+                RESPONSE=-10
+            END
+
+            IF AUTO_RC=1 THEN
+            BEGIN
+                IF PROCSTATUS=-1 THEN
                 BEGIN
-                    RESPONSE=-12
-                END
-                ELSE
-                BEGIN
-                    MOVE_STATE=1
                     MOVE_ERROR=0
+                    MOVE_STATE=1
                     MOVE_PROCESS=3
 
                     START PCCIRC
 
                     RESPONSE=10
+                END
+
+                IF PROCSTATUS<>-1 THEN
+                BEGIN
+                    RESPONSE=-11
                 END
             END
         END
@@ -572,6 +579,7 @@ END
 
         MOVE_STATE=0
         MOVE_ERROR=0
+        MOVE_PROCESS=0
 
         RESPONSE=13
 
