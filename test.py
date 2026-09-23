@@ -1,26 +1,28 @@
 from rho4 import Rho4
 
-rho = Rho4("192.168.4.1", 6051)
+
+rho = Rho4("127.0.0.1", 6051)
 rho.connect()
 
-try:
+x, y, z, r = rho.get_position()
 
-    x, y, z, r = rho.get_position()
+path = rho.check_linear_path(
+    x - 50,
+    y + 50,
+    z,
+    r,
+    step_mm=2.0
+)
 
-    try:
-        rho.start_linear(
-            650.0,   # mimo maximalni dosah 600 mm
-            0.0,
-            z,
-            r,
-            speed_mm_s=5.0
-        )
+print("Vzorku:", len(path))
 
-        print("CHYBA: pohyb byl povolen!")
+for p in path:
+    print(
+        f"{p['t']*100:6.1f}%  "
+        f"XY=({p['x']:8.3f},{p['y']:8.3f})  "
+        f"A1={p['a1']:8.3f} "
+        f"A2={p['a2']:8.3f} "
+        f"A4={p['a4']:8.3f}"
+    )
 
-    except ValueError as e:
-        print("SPRAVNE ZABLOKOVANO:")
-        print(e)
-
-finally:
-    rho.disconnect()
+rho.disconnect()

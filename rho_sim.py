@@ -3,6 +3,7 @@ import struct
 import threading
 import time
 import math
+import tkinter as tk
 
 HOST = "127.0.0.1"
 PORT = 6051
@@ -19,12 +20,28 @@ START_MANUAL = -10
 START_BUSY = -11
 START_RC_ERROR = -12
 
+# SR6 geometry (from the robot manual)
+ARM_L1 = 330.0
+ARM_L2 = 270.0
+A1_MIN = -140.0
+A1_MAX = 140.0
+A2_MIN = -150.0
+A2_MAX = 150.0
+
+# A1 is calculated/displayed only for now.
+# We will enable A1 limit checking after verifying the robot XY zero direction.
+CHECK_A1_LIMIT = True
+
+# Simulator-only travel-range-like error
+TRAVEL_RANGE_ERROR = 22144
+
 # Simulator state
 lock = threading.RLock()
 
 position = [300.0, 300.0, 180.0, 0.0]
 target = position.copy()
 ptp_speed_factor = 0.02       # driver sends speed / 100
+linear_speed_mm_s = 10.0      # CMD16 speed, mm/s
 
 automatic = True
 alarm = False
@@ -39,6 +56,73 @@ procstatus = -1
 
 stop_requested = False
 shutdown_requested = False
+
+
+def inverse_xy(x, y):
+    """Return the two mathematical planar 2R IK solutions (A1, A2) in degrees."""
+    l1 = ARM_L1
+    l2 = ARM_L2
+    r2 = x * x + y * y
+
+    cos_a2 = (r2 - l1 * l1 - l2 * l2) / (2.0 * l1 * l2)
+    if cos_a2 < -1.0 or cos_a2 > 1.0:
+        return []
+
+    cos_a2 = max(-1.0, min(1.0, cos_a2))
+    a2_abs = math.acos(cos_a2)
+    solutions = []
+
+    for a2 in (a2_abs, -a2_abs):
+        k1 = l1 + l2 * math.cos(a2)
+        k2 = l2 * math.sin(a2)
+        a1 = math.atan2(y, x) - math.atan2(k2, k1)
+        a1 = math.atan2(math.sin(a1), math.cos(a1))
+        solutions.append((math.degrees(a1), math.degrees(a2)))
+
+    return solutions
+
+
+def valid_xy_solutions(x, y):
+    """Return IK solutions allowed by currently enabled software limits."""
+    valid = []
+    for a1, a2 in inverse_xy(x, y):
+        if not (A2_MIN <= a2 <= A2_MAX):
+            continue
+        if CHECK_A1_LIMIT and not (A1_MIN <= a1 <= A1_MAX):
+            continue
+        valid.append((a1, a2))
+    return valid
+
+
+def xy_reachable(x, y):
+    return bool(valid_xy_solutions(x, y))
+
+
+def choose_ik_solution(x, y, previous=None):
+    """Choose a stable solution for drawing; prefer the branch closest to previous."""
+    solutions = valid_xy_solutions(x, y)
+    if not solutions:
+        return None
+
+    if previous is None:
+        # No previous joint state is known yet.
+        return min(solutions, key=lambda q: abs(q[0]) + abs(q[1]))
+
+    return min(
+        solutions,
+        key=lambda q: abs(q[0] - previous[0]) + abs(q[1] - previous[1])
+    )
+
+
+def get_joint_position():
+    # Relation verified on real SR6: R=A1+A2+A4, A3=Z.
+    with lock:
+        p = position.copy()
+    ik = choose_ik_solution(p[0], p[1])
+    if ik is None:
+        raise ValueError(f"Current XY unreachable: X={p[0]:.3f} Y={p[1]:.3f}")
+    a1, a2 = ik
+    return a1, a2, p[2], p[3] - a1 - a2
 
 
 def recv_exact(sock, size):
@@ -127,14 +211,121 @@ def start_motion():
             set_move_state(MOVE_ERROR, 144384, 144384)
             return START_RC_ERROR
 
+        if not xy_reachable(target[0], target[1]):
+            set_move_state(MOVE_ERROR, TRAVEL_RANGE_ERROR, TRAVEL_RANGE_ERROR)
+            print(
+                f"[LIMIT] XY target unreachable: "
+                f"X={target[0]:.3f} Y={target[1]:.3f}"
+            )
+            return START_RC_ERROR
+
         stop_requested = False
 
     threading.Thread(target=motion_worker, daemon=True).start()
     return START_OK
 
 
+def linear_motion_worker(dest, speed_mm_s):
+    """
+    Simulated Cartesian LINEAR move.
+
+    The TCP follows a straight line in X/Y/Z. R is interpolated together
+    with the move. smoothstep only changes acceleration/deceleration;
+    the geometric path remains a straight line.
+    """
+    global position, in_position, stop_requested
+
+    with lock:
+        start = position.copy()
+        stop_requested = False
+        in_position = False
+        set_move_state(MOVE_RUNNING, 0, 1)
+
+    dx = dest[0] - start[0]
+    dy = dest[1] - start[1]
+    dz = dest[2] - start[2]
+
+    distance = math.sqrt(dx*dx + dy*dy + dz*dz)
+    velocity = max(0.1, float(speed_mm_s))
+    duration = max(0.15, distance / velocity)
+
+    t0 = time.monotonic()
+
+    while True:
+        with lock:
+            if stop_requested:
+                in_position = False
+                set_move_state(MOVE_STOPPED, 0, -1)
+                return
+
+        elapsed = time.monotonic() - t0
+        u = min(1.0, elapsed / duration)
+
+        # Acceleration/deceleration profile.
+        # Every coordinate uses the same parameter, so the XYZ path is straight.
+        s = u * u * (3.0 - 2.0 * u)
+
+        with lock:
+            position = [
+                start[i] + (dest[i] - start[i]) * s
+                for i in range(4)
+            ]
+
+        if u >= 1.0:
+            break
+
+        time.sleep(0.01)
+
+    with lock:
+        position = dest.copy()
+        in_position = True
+        set_move_state(MOVE_DONE, 0, -1)
+
+
+def start_linear_motion(dest, speed_mm_s):
+    global stop_requested, target, linear_speed_mm_s
+
+    with lock:
+        if not automatic:
+            return START_MANUAL
+
+        if move_state == MOVE_RUNNING:
+            return START_BUSY
+
+        if move_state == MOVE_ERROR:
+            return START_RC_ERROR
+
+        if alarm:
+            set_move_state(MOVE_ERROR, 144384, 144384)
+            return START_RC_ERROR
+
+        if speed_mm_s <= 0.0:
+            print(f"[LINEAR] Invalid speed: {speed_mm_s}")
+            return START_RC_ERROR
+
+        if not xy_reachable(dest[0], dest[1]):
+            set_move_state(MOVE_ERROR, TRAVEL_RANGE_ERROR, TRAVEL_RANGE_ERROR)
+            print(
+                f"[LIMIT] LINEAR target unreachable: "
+                f"X={dest[0]:.3f} Y={dest[1]:.3f}"
+            )
+            return START_RC_ERROR
+
+        target = list(dest)
+        linear_speed_mm_s = float(speed_mm_s)
+        stop_requested = False
+
+    threading.Thread(
+        target=linear_motion_worker,
+        args=(list(dest), float(speed_mm_s)),
+        daemon=True
+    ).start()
+
+    return START_OK
+
+
 def handle_client(conn, addr):
-    global target, ptp_speed_factor
+    global target, ptp_speed_factor, linear_speed_mm_s
     global move_state, move_error, procstatus
     global stop_requested
 
@@ -216,6 +407,43 @@ def handle_client(conn, addr):
                     stop_requested = True
                 print("[PCMOVE] STOP")
                 conn.sendall(struct.pack("<i", 15))
+
+            # CMD 16 - START LINEAR
+            #
+            # Payload:
+            #   float32 X
+            #   float32 Y
+            #   float32 Z
+            #   float32 R
+            #   float32 speed_mm_s
+            #
+            # Reply:
+            #   int32 START_OK / START_MANUAL / START_BUSY / START_RC_ERROR
+            elif cmd == 16:
+                data = recv_exact(conn, 20)
+                x, y, z, r, speed_mm_s = struct.unpack("<fffff", data)
+
+                response = start_linear_motion(
+                    [x, y, z, r],
+                    speed_mm_s
+                )
+
+                print(
+                    "[LINEAR] "
+                    f"X={x:.3f} Y={y:.3f} Z={z:.3f} R={r:.3f} "
+                    f"V={speed_mm_s:.3f} mm/s -> {response}"
+                )
+
+                conn.sendall(struct.pack("<i", response))
+
+            # CMD 17 - ACTUAL JOINT POSITION: A1, A2, A3, A4
+            elif cmd == 17:
+                try:
+                    joints = get_joint_position()
+                    conn.sendall(struct.pack("<ffff", *joints))
+                except ValueError as e:
+                    print(f"[JOINT] {e}")
+                    conn.sendall(struct.pack("<ffff", float("nan"), float("nan"), float("nan"), float("nan")))
 
             else:
                 print(f"[WARN] Unknown command: {cmd}")
@@ -316,14 +544,177 @@ Simulator console:
             print("Bad value:", e)
 
 
-def main():
-    threading.Thread(target=console_worker, daemon=True).start()
+class SimulatorView:
+    def __init__(self):
+        self.root = tk.Tk()
+        self.root.title("Bosch Rexroth SR6 - RHO4 Simulator")
+        self.root.geometry("820x760")
+        self.root.resizable(False,False)
 
+        self.canvas = tk.Canvas(
+            self.root,
+            width=780,
+            height=620,
+            bg="white",
+            highlightthickness=1,
+            highlightbackground="#777"
+        )
+        self.canvas.pack(padx=20, pady=(20, 8))
+
+        self.info = tk.Label(
+            self.root,
+            text="",
+            justify="left",
+            anchor="w",
+            font=("Consolas", 11)
+        )
+        self.info.pack(fill="x", padx=20, pady=(0, 15))
+
+        self.last_ik = None
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.update_view()
+
+    def on_close(self):
+        self.root.destroy()
+
+    def world_to_canvas(self, x, y):
+        # Base in the middle. Mathematical +Y is drawn upward.
+        cx = 390.0
+        cy = 310.0
+        scale = 0.46
+        return cx + x * scale, cy - y * scale
+
+    def draw_workspace(self):
+        cx, cy = self.world_to_canvas(0.0, 0.0)
+        scale = 0.46
+
+        # Geometrical maximum reach
+        rmax = (ARM_L1 + ARM_L2) * scale
+        self.canvas.create_oval(
+            cx-rmax, cy-rmax, cx+rmax, cy+rmax,
+            outline="#bbbbbb", dash=(5, 4), width=1
+        )
+
+        # Inner radius produced by |A2| <= 150 deg.
+        a2 = math.radians(A2_MAX)
+        rmin_mm = math.sqrt(
+            ARM_L1**2 + ARM_L2**2 +
+            2.0 * ARM_L1 * ARM_L2 * math.cos(a2)
+        )
+        rmin = rmin_mm * scale
+        self.canvas.create_oval(
+            cx-rmin, cy-rmin, cx+rmin, cy+rmin,
+            outline="#dddddd", dash=(3, 3), width=1
+        )
+
+        # Axes
+        self.canvas.create_line(30, cy, 750, cy, fill="#dddddd")
+        self.canvas.create_line(cx, 30, cx, 590, fill="#dddddd")
+        self.canvas.create_text(742, cy-12, text="+X", fill="#777")
+        self.canvas.create_text(cx+16, 38, text="+Y", fill="#777")
+
+    def draw_robot(self, x, y, ik):
+        bx, by = self.world_to_canvas(0.0, 0.0)
+
+        if ik is None:
+            self.canvas.create_oval(
+                bx-7, by-7, bx+7, by+7,
+                fill="black", outline=""
+            )
+            return
+
+        a1, a2 = ik
+        q1 = math.radians(a1)
+        q2 = math.radians(a2)
+
+        elbow_x = ARM_L1 * math.cos(q1)
+        elbow_y = ARM_L1 * math.sin(q1)
+
+        ex, ey = self.world_to_canvas(elbow_x, elbow_y)
+        tx, ty = self.world_to_canvas(x, y)
+
+        self.canvas.create_line(
+            bx, by, ex, ey,
+            width=7, fill="#3b82f6"
+        )
+        self.canvas.create_line(
+            ex, ey, tx, ty,
+            width=7, fill="#ef4444"
+        )
+
+        self.canvas.create_oval(bx-8, by-8, bx+8, by+8, fill="black")
+        self.canvas.create_oval(ex-7, ey-7, ex+7, ey+7, fill="#222")
+        self.canvas.create_oval(tx-6, ty-6, tx+6, ty+6, fill="#16a34a")
+
+    def update_view(self):
+        global shutdown_requested
+
+        with lock:
+            p = position.copy()
+            t = target.copy()
+            state = move_state
+            err = move_error
+            proc = procstatus
+            speed = ptp_speed_factor
+            lin_speed = linear_speed_mm_s
+            auto = automatic
+            alm = alarm
+            ref = referenced
+
+        self.canvas.delete("all")
+        self.draw_workspace()
+
+        ik = choose_ik_solution(p[0], p[1], self.last_ik)
+        if ik is not None:
+            self.last_ik = ik
+
+        self.draw_robot(p[0], p[1], ik)
+
+        # Target cross
+        tx, ty = self.world_to_canvas(t[0], t[1])
+        self.canvas.create_line(tx-8, ty, tx+8, ty, fill="#8b5cf6", width=2)
+        self.canvas.create_line(tx, ty-8, tx, ty+8, fill="#8b5cf6", width=2)
+        self.canvas.create_text(tx+10, ty-12, text="TARGET", anchor="w", fill="#8b5cf6")
+
+        if ik is None:
+            ik_text = "A1=---  A2=---  A3=---  A4=---  XY: UNREACHABLE"
+        else:
+            a1, a2 = ik
+            a3 = p[2]
+            a4 = p[3] - a1 - a2
+            ik_text = (
+                f"A1={a1:8.2f}°  A2={a2:8.2f}°  "
+                f"A3={a3:8.2f}   A4={a4:8.2f}°"
+            )
+
+        target_ok = xy_reachable(t[0], t[1])
+
+        self.info.config(
+            text=(
+                f"POSITION  X={p[0]:8.3f}  Y={p[1]:8.3f}  "
+                f"Z={p[2]:8.3f}  R={p[3]:8.3f}\n"
+                f"IK        {ik_text}\n"
+                f"TARGET    X={t[0]:8.3f}  Y={t[1]:8.3f}  "
+                f"Z={t[2]:8.3f}  R={t[3]:8.3f}  "
+                f"{'OK' if target_ok else 'UNREACHABLE'}\n"
+                f"STATE={state}  ERROR={err}  PROC={proc}  "
+                f"PTP={speed*100.0:.2f}%  LIN={lin_speed:.2f} mm/s  "
+                f"AUTO={int(auto)} ALARM={int(alm)} REF={int(ref)}\n"
+                f"A1 limit check: {'ON' if CHECK_A1_LIMIT else 'OFF'}  CMD17: ON"
+            )
+        )
+
+        self.root.after(30, self.update_view)
+
+    def run(self):
+        self.root.mainloop()
+
+
+def server_worker():
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server.bind((HOST, PORT))
         server.listen(5)
-
         print(f"RHO4 simulator listening on {HOST}:{PORT}")
 
         while True:
@@ -333,6 +724,14 @@ def main():
                 args=(conn, addr),
                 daemon=True
             ).start()
+
+
+def main():
+    threading.Thread(target=console_worker, daemon=True).start()
+    threading.Thread(target=server_worker, daemon=True).start()
+
+    view = SimulatorView()
+    view.run()
 
 
 if __name__ == "__main__":

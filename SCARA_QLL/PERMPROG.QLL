@@ -20,6 +20,18 @@ PUBLIC REAL: TARGET_R
 PUBLIC REAL: MOVE_SPEED
 PUBLIC REAL: LINEAR_SPEED
 
+PUBLIC REAL: CIRC_MID_X
+PUBLIC REAL: CIRC_MID_Y
+PUBLIC REAL: CIRC_MID_Z
+PUBLIC REAL: CIRC_MID_R
+
+PUBLIC REAL: CIRC_END_X
+PUBLIC REAL: CIRC_END_Y
+PUBLIC REAL: CIRC_END_Z
+PUBLIC REAL: CIRC_END_R
+
+PUBLIC REAL: CIRC_SPEED
+
 ; MOVE_STATE:
 ; 0 = IDLE
 ; 1 = PCMOVE spusten / pohyb
@@ -38,6 +50,7 @@ PUBLIC INTEGER: MOVE_ERROR
 
 EXTERNAL: PCMOVE
 EXTERNAL: PCLINEAR
+EXTERNAL: PCCIRC
 
 
 ; ============================================================
@@ -128,11 +141,16 @@ BEGIN
     BEGIN
         PROCSTATUS=CONDITION(PCMOVE)
     END
-    IF MOVE_PROCESS=2 THEN
     
+    IF MOVE_PROCESS=2 THEN    
     BEGIN
         PROCSTATUS=CONDITION(PCLINEAR)
-    END    
+    END
+
+    IF MOVE_PROCESS=3 THEN
+    BEGIN
+        PROCSTATUS=CONDITION(PCCIRC)
+    END
 
     IF PROCSTATUS>100 THEN
     BEGIN
@@ -378,9 +396,11 @@ END
     BEGIN
         IF CONDITION(PCMOVE)<>-1 THEN STOP PCMOVE
         IF CONDITION(PCLINEAR)<>-1 THEN STOP PCLINEAR
+        IF CONDITION(PCCIRC)<>-1 THEN STOP PCCIRC
 
         MOVE_STATE=4
         MOVE_ERROR=0
+        MOVE_PROCESS=0
         RESPONSE=15
         WRITE WIN_1,RESPONSE
     END
@@ -442,6 +462,54 @@ END
 
     END
 
+    IF CMD=18 THEN
+    BEGIN
+        READ WIN_1,CIRC_MID_X
+        READ WIN_1,CIRC_MID_Y
+        READ WIN_1,CIRC_MID_Z
+        READ WIN_1,CIRC_MID_R
+
+        READ WIN_1,CIRC_END_X
+        READ WIN_1,CIRC_END_Y
+        READ WIN_1,CIRC_END_Z
+        READ WIN_1,CIRC_END_R
+
+        READ WIN_1,CIRC_SPEED
+
+        IF AUTO_RC=0 THEN
+        BEGIN
+            RESPONSE=-10
+        END
+        ELSE
+        BEGIN
+            IF MOVE_STATE=1 THEN
+            BEGIN
+                RESPONSE=-11
+            END
+            ELSE
+            BEGIN
+                PROCSTATUS=CONDITION(PCCIRC)
+
+                IF PROCSTATUS>100 THEN
+                BEGIN
+                    RESPONSE=-12
+                END
+                ELSE
+                BEGIN
+                    MOVE_STATE=1
+                    MOVE_ERROR=0
+                    MOVE_PROCESS=3
+
+                    START PCCIRC
+
+                    RESPONSE=10
+                END
+            END
+        END
+
+        WRITE WIN_1,RESPONSE
+    END
+
     ; --------------------------------------------------------
     ; CMD 12
     ; STAV POHYBU
@@ -464,6 +532,11 @@ END
         IF MOVE_PROCESS=2 THEN
         BEGIN
             PROCSTATUS=CONDITION(PCLINEAR)
+        END
+
+        IF MOVE_PROCESS=3 THEN
+        BEGIN
+            PROCSTATUS=CONDITION(PCCIRC)
         END
 
         ; jeste jednou zkontrolujeme RC error,
