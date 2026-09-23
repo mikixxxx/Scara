@@ -18,6 +18,7 @@ PUBLIC REAL: TARGET_Y
 PUBLIC REAL: TARGET_Z
 PUBLIC REAL: TARGET_R
 PUBLIC REAL: MOVE_SPEED
+PUBLIC REAL: LINEAR_SPEED
 
 ; MOVE_STATE:
 ; 0 = IDLE
@@ -36,6 +37,7 @@ PUBLIC INTEGER: MOVE_ERROR
 ; ============================================================
 
 EXTERNAL: PCMOVE
+EXTERNAL: PCLINEAR
 
 
 ; ============================================================
@@ -68,7 +70,9 @@ INTEGER: AUTOSTATUS
 INTEGER: WINSTATUS
 INTEGER: PROCSTATUS
 
+INTEGER: MOVE_PROCESS
 POINT: ACTPOS
+JC_POINT: @ACTJOINT
 
 REAL: XVAL
 REAL: YVAL
@@ -90,7 +94,8 @@ BEGIN
 MOVE_STATE=0
 MOVE_ERROR=0
 MOVE_SPEED=0.02
-
+LINEAR_SPEED=10.0
+MOVE_PROCESS=0
 Loop:
 
 
@@ -119,7 +124,15 @@ Loop:
 IF MOVE_STATE<>0 THEN
 BEGIN
 
-    PROCSTATUS=CONDITION(PCMOVE)
+    IF MOVE_PROCESS=1 THEN
+    BEGIN
+        PROCSTATUS=CONDITION(PCMOVE)
+    END
+    IF MOVE_PROCESS=2 THEN
+    
+    BEGIN
+        PROCSTATUS=CONDITION(PCLINEAR)
+    END    
 
     IF PROCSTATUS>100 THEN
     BEGIN
@@ -271,7 +284,7 @@ BEGIN
 
                 MOVE_ERROR=0
                 MOVE_STATE=1
-
+                MOVE_PROCESS=1
                 START PCMOVE
 
                 RESPONSE=10
@@ -363,15 +376,69 @@ END
 
     IF CMD=15 THEN
     BEGIN
-
-        STOP PCMOVE
+        IF CONDITION(PCMOVE)<>-1 THEN STOP PCMOVE
+        IF CONDITION(PCLINEAR)<>-1 THEN STOP PCLINEAR
 
         MOVE_STATE=4
         MOVE_ERROR=0
-
         RESPONSE=15
+        WRITE WIN_1,RESPONSE
+    END
+
+    IF CMD=16 THEN
+    BEGIN
+        READ WIN_1,TARGET_X
+        READ WIN_1,TARGET_Y
+        READ WIN_1,TARGET_Z
+        READ WIN_1,TARGET_R
+        READ WIN_1,LINEAR_SPEED
+
+        RESPONSE=0
+        PROCSTATUS=CONDITION(PCLINEAR)
+
+        IF PROCSTATUS>100 THEN
+        BEGIN
+            MOVE_STATE=3
+            MOVE_ERROR=PROCSTATUS
+            RESPONSE=-12
+        END
+
+        IF PROCSTATUS<=100 THEN
+        BEGIN
+            IF AUTO_RC=0 THEN
+            BEGIN
+                RESPONSE=-10
+            END
+
+            IF AUTO_RC=1 THEN
+            BEGIN
+                IF PROCSTATUS=-1 THEN
+                BEGIN
+                    MOVE_ERROR=0
+                    MOVE_STATE=1
+                    MOVE_PROCESS=2
+                    START PCLINEAR
+                    RESPONSE=10
+                END
+
+                IF PROCSTATUS<>-1 THEN
+                BEGIN
+                    RESPONSE=-11
+                END
+            END
+        END
 
         WRITE WIN_1,RESPONSE
+    END
+    
+    IF CMD=17 THEN
+    BEGIN
+        @ACTJOINT=@POS
+
+        WRITE WIN_1,@ACTJOINT.A1
+        WRITE WIN_1,@ACTJOINT.A2
+        WRITE WIN_1,@ACTJOINT.A3
+        WRITE WIN_1,@ACTJOINT.A4
 
     END
 
@@ -388,8 +455,16 @@ END
     IF CMD=12 THEN
     BEGIN
 
-        PROCSTATUS=CONDITION(PCMOVE)
+        PROCSTATUS=-1
+        IF MOVE_PROCESS=1 THEN
+        BEGIN
+            PROCSTATUS=CONDITION(PCMOVE)
+        END
 
+        IF MOVE_PROCESS=2 THEN
+        BEGIN
+            PROCSTATUS=CONDITION(PCLINEAR)
+        END
 
         ; jeste jednou zkontrolujeme RC error,
         ; aby CMD12 vratil rovnou MOVE_STATE=3

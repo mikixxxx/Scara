@@ -33,10 +33,13 @@ class Rho4:
     ARM_L2 = 270.0
 
     A1_MIN = -140.0
-    A1_MAX = 140.0
+    A1_MAX =  140.0
 
     A2_MIN = -150.0
-    A2_MAX = 150.0
+    A2_MAX =  150.0
+
+    A4_MIN = -180.0
+    A4_MAX =  180.0
 
     Z_MIN = 5.0
     Z_MAX = 195.0
@@ -60,7 +63,6 @@ class Rho4:
     def __init__(
         self,
         host="127.0.0.1",
-        #host="192.168.4.1",
         port=6051,
         timeout=3.0
     ):
@@ -330,55 +332,90 @@ class Rho4:
             time.sleep(0.05)
         
 
-    def check_target(self,x,y,z,r):
-        valid = self.check_xy_kinematics(x,y)
+    def check_target(self, x, y, z, r):
+        solutions = self.inverse_xy(float(x), float(y))
+        if not solutions:
+            raise ValueError(f"Target X={x:.3f} Y={y:.3f} je mimo geometricky dosah robota")
+
+        valid = []
+        for a1, a2 in solutions:
+            # Overeno na skutecnem SR6: R = A1 + A2 + A4
+            a4 = float(r) - a1 - a2
+
+            if not (self.A1_MIN <= a1 <= self.A1_MAX):
+                continue
+            if not (self.A2_MIN <= a2 <= self.A2_MAX):
+                continue
+            if not (self.A4_MIN <= a4 <= self.A4_MAX):
+                continue
+
+            valid.append({
+                "a1": a1,
+                "a2": a2,
+                "a3": float(z),
+                "a4": a4,
+            })
+
         if not valid:
-            raise ValueError(f"XY cil X={x:.3f}, Y={y:.3f} " f"neni v povolenem pracovni prostoru")
-
-        if not self.Z_MIN <= z <= self.Z_MAX:
-                    raise ValueError(f"Z={z:.3f} mimo soft limit "f"{self.Z_MIN:.3f} .. {self.Z_MAX:.3f}")
-
-        if not self.R_MIN <= r <= self.R_MAX:
-                    raise ValueError(f"R={r:.3f} mimo soft limit "f"{self.R_MIN:.3f} .. {self.R_MAX:.3f}")
-
-        return True
+            raise ValueError(
+                f"Target X={x:.3f} Y={y:.3f} Z={z:.3f} R={r:.3f} "
+                "nema zadnou konfiguraci v limitech A1/A2/A4"
+            )
+        return valid
 
     def inverse_xy(self, x, y):
         l1 = self.ARM_L1
         l2 = self.ARM_L2
         r2 = x*x + y*y
-        cos_a2 = (r2 - l1*l1 - l2*l2)/(2.0*l1*l2)
 
+        cos_a2 = (r2 - l1*l1 - l2*l2) / (2.0*l1*l2)
         if cos_a2 < -1.0 or cos_a2 > 1.0:
             return []
-        cos_a2 = max(-1.0, min(1.0,cos_a2))
 
+        cos_a2 = max(-1.0, min(1.0, cos_a2))
         a2_abs = math.acos(cos_a2)
         solutions = []
 
         for a2 in (a2_abs, -a2_abs):
-            k1 = l1+l2*math.cos(a2)
-            k2 = l2*math.cos(a2)
-            a1 = math.atan2(y,x) - math.atan2(k1,k2)
+            k1 = l1 + l2 * math.cos(a2)
+            k2 = l2 * math.sin(a2)
+            a1 = math.atan2(y, x) - math.atan2(k2, k1)
+            a1 = math.atan2(math.sin(a1), math.cos(a1))
+            solutions.append((math.degrees(a1), math.degrees(a2)))
 
-        a1 = math.atan2(math.sin(a1),math.cos(a1))
-
-        solutions.append((math.degrees(a1),math.degrees(a2)))
         return solutions
 
-    def check_xy_kinematics(self,x,y):
-        solutions = self.inverse_xy(x,y)
+    def check_xy_kinematics(self, x, y):
         valid = []
-        for a1, a2 in solutions:
-            if(self.A2_MIN <= a2 <= self.A2_MAX):  # self.A1_MIN <= a1 <= self.A1_MAX and 
-                valid.append((a1,a2))
-        return valid            
+        for a1, a2 in self.inverse_xy(x, y):
+            if (
+                self.A1_MIN <= a1 <= self.A1_MAX
+                and self.A2_MIN <= a2 <= self.A2_MAX
+            ):
+                valid.append((a1, a2))
+        return valid
 
+    @staticmethod
+    def _angle_delta_deg(a, b):
+        return (a - b + 180.0) % 360.0 - 180.0
+
+    def select_target_configuration(self, x, y, z, r):
+        valid = self.check_target(x, y, z, r)
+        current_a1, current_a2, _, _ = self.get_joint_position()
+
+        def distance(solution):
+            da1 = self._angle_delta_deg(solution["a1"], current_a1)
+            da2 = self._angle_delta_deg(solution["a2"], current_a2)
+            return da1*da1 + da2*da2
+
+        return min(valid, key=distance)
 
 
     def start_linear(self, x,y,z,r,speed_mm_s=10.0):
+        self.check_linear_path(x,y,z,r,step_mm=2.0)
+
         if speed_mm_s <= 0:
-            raise ValueError ("LINEAR speed musi byt > 0mm/s")
+            raise ValueError("LINEAR speed musi byt > 0 mm/s")
 
         with self._lock:
             #CMD16
@@ -392,14 +429,92 @@ class Rho4:
         if response == self.START_BUSY:
             raise RuntimeError("Robot uz provadi pohyb")
         if response == self.START_RC_ERROR:
-            state,error,procstatus = self.get_status()
-            raise RuntimeError(f"LINEAR RC error: "f"{error} "f"(procstatus={procstatus})")
+            state, error, procstatus = self.get_move_state()
+            raise RuntimeError(
+                f"LINEAR RC error: {error} "
+                f"(ProcStatus={procstatus})"
+            )
 
         if response != self.START_OK:
             raise RuntimeError(f"Chyba pri startu LINEAR: {response}")
 
         return True
 
+    def get_joint_position(self):
+        with self._lock:
+            assert self.sock is not None
+            self.sock.sendall(struct.pack("<i",17))
+            data = self._recv_exact(16)
+            return struct.unpack("<ffff",data)
+
+    def check_linear_path(self,x,y,z,r,step_mm=2.0, joint_step_limit=10.0):
+        if step_mm <= 0:
+            raise ValueError("step_mm musi byt > 0")
+        sx,sy,sz,sr = self.get_position()
+        ca1,ca2,ca3,ca4 = self.get_joint_position()
+
+        dx = float(x) - sx
+        dy = float(y) - sy
+        dz = float(z) - sz
+        dr = self._angle_delta_deg(float(r),sr)
+
+        length = math.sqrt(dx*dx + dy*dy + dz*dz)
+        samples = max(1, int(math.ceil(length/step_mm)))
+        previous = {"a1": ca1, "a2": ca2, "a3": ca3, "a4": ca4,}
+
+        path = []
+        for i in range(1, samples +1):
+            t = i/samples
+            px = sx + dx *t
+            py = sy + dy * t
+            pz = sz + dz * t
+            pr = sr + dr * t
+            solutions = self.check_target(px,py,pz,pr)
+
+            def joint_distance(sol):
+                da1 = self._angle_delta_deg(
+                    sol["a1"],
+                    previous["a1"]
+                )
+
+                da2 = self._angle_delta_deg(
+                    sol["a2"],
+                    previous["a2"]
+                )
+
+                da4 = self._angle_delta_deg(
+                    sol["a4"],
+                    previous["a4"]
+                )
+                return (da1*da1 + da2*da2 + da4*da4)
+
+            selected = min(solutions, key=joint_distance)
+            da1 = abs(self._angle_delta_deg(selected["a1"],previous["a1"]))
+            da2 = abs(self._angle_delta_deg(selected["a2"],previous["a2"]))
+            da4 = abs(self._angle_delta_deg(selected["a4"],previous["a4"]))
+
+            if max(da1,da2,da4) > joint_step_limit:
+                            raise ValueError(
+                                "LINEAR path: prilis velky skok jointu "
+                                f"v {t*100:.1f}% drahy: "
+                                f"dA1={da1:.2f} "
+                                f"dA2={da2:.2f} "
+                                f"dA4={da4:.2f}")
+            point = {
+                "t": t,
+                "x": px,
+                "y": py,
+                "z": pz,
+                "r": pr,
+                "a1": selected["a1"],
+                "a2": selected["a2"],
+                "a3": selected["a3"],
+                "a4": selected["a4"],}
+            
+            path.append(point)
+            previous = selected
+        return path
+    
           
     # =========================================================
     # HIGH LEVEL LINEAR MOVE

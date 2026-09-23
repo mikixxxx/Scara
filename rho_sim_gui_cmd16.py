@@ -30,7 +30,7 @@ A2_MAX = 150.0
 
 # A1 is calculated/displayed only for now.
 # We will enable A1 limit checking after verifying the robot XY zero direction.
-CHECK_A1_LIMIT = False
+CHECK_A1_LIMIT = True
 
 # Simulator-only travel-range-like error
 TRAVEL_RANGE_ERROR = 22144
