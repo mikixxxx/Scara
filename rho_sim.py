@@ -44,6 +44,37 @@ target = position.copy()
 ptp_speed_factor = 0.02       # driver sends speed / 100
 linear_speed_mm_s = 10.0      # CMD16 speed, mm/s
 circular_speed_mm_s = 10.0    # CMD18 speed, mm/s
+path_speed_mm_s = 5.0        # CMD20/21 PCPATH speed, mm/s
+path_buffer = []              # uploaded absolute XYZR points, max 16
+path_active_segment = -1      # 0-based segment while PCPATH is running
+
+# ============================================================
+# STREAM V1 - simulator prototype of double buffering
+#
+# CMD22 = upload slot A/B
+# CMD23 = start stream
+# CMD24 = stream status
+#
+# IMPORTANT:
+# This proves the PC-side ping-pong logic and visualization.
+# It is NOT yet proof that the real RHO4 can switch dynamic
+# buffers without a speed dip. That BAPS hand-off is the next
+# controller-side problem.
+# ============================================================
+STREAM_UPLOAD_OK = 22
+STREAM_SLOT_ERROR = -22
+STREAM_SLOT_BUSY = -23
+STREAM_NOT_READY = -24
+STREAM_SEQUENCE_ERROR = -25
+STREAM_UNDERRUN_ERROR = 29001
+
+stream_slots = [None, None]
+stream_running = False
+stream_active_slot = -1
+stream_active_seq = -1
+stream_completed_seq = -1
+stream_underruns = 0
+stream_active_segment = -1
 
 automatic = True
 alarm = False
@@ -537,8 +568,599 @@ def start_circular_motion(mid, dest, speed_mm_s):
     return START_OK
 
 
+
+def _path_segment_metric(a, b):
+    """
+    Metric used only for simulator timing.
+    Cartesian distance dominates. A pure-R move still gets non-zero duration.
+    """
+    dx = b[0] - a[0]
+    dy = b[1] - a[1]
+    dz = b[2] - a[2]
+    xyz = math.sqrt(dx*dx + dy*dy + dz*dz)
+    dr = abs(_angle_delta_deg(b[3], a[3]))
+    return max(xyz, dr * 0.10)
+
+
+def validate_linear_xy_segment(a, b, step_mm=2.0):
+    """Sample one PCPATH LINEAR segment against the XY workspace."""
+    length = math.hypot(b[0] - a[0], b[1] - a[1])
+    samples = max(1, int(math.ceil(length / max(0.1, step_mm))))
+
+    for i in range(samples + 1):
+        u = i / samples
+        x = a[0] + (b[0] - a[0]) * u
+        y = a[1] + (b[1] - a[1]) * u
+        if not xy_reachable(x, y):
+            raise ValueError(
+                f"PCPATH segment unreachable at {u*100.0:.1f}%: "
+                f"X={x:.3f} Y={y:.3f}"
+            )
+
+
+def validate_path(points):
+    """Validate all uploaded PCPATH points and straight segments between them."""
+    if not 1 <= len(points) <= 16:
+        raise ValueError("PCPATH requires 1..16 points")
+
+    with lock:
+        start = position.copy()
+
+    previous = start
+    for index, point in enumerate(points, start=1):
+        if not xy_reachable(point[0], point[1]):
+            raise ValueError(
+                f"PCPATH P{index} unreachable: "
+                f"X={point[0]:.3f} Y={point[1]:.3f}"
+            )
+        validate_linear_xy_segment(previous, point, step_mm=2.0)
+        previous = point
+
+
+def upload_path_buffer(points, speed_mm_s):
+    """Simulator equivalent of PERMPROG CMD20."""
+    global path_buffer, path_speed_mm_s
+
+    if not 1 <= len(points) <= 16:
+        return -20
+    if speed_mm_s <= 0.0:
+        return -21
+
+    with lock:
+        path_buffer = [list(p) for p in points]
+        path_speed_mm_s = float(speed_mm_s)
+
+    print(
+        f"[PCPATH] uploaded {len(points)} points, "
+        f"V={speed_mm_s:.3f} mm/s"
+    )
+    return 20
+
+
+def path_motion_worker(points, speed_mm_s):
+    """
+    Simulate one PROGR_SLOPE block.
+
+    This uses one continuous distance parameter across the entire polyline.
+    Velocity does not fall to zero at intermediate VIA points. Acceleration
+    happens only at the beginning and deceleration only near the final TO.
+    """
+    global position, in_position, path_active_segment
+
+    with lock:
+        start = position.copy()
+
+    nodes = [start] + [list(p) for p in points]
+    lengths = [
+        _path_segment_metric(nodes[i], nodes[i + 1])
+        for i in range(len(nodes) - 1)
+    ]
+
+    total_length = sum(lengths)
+
+    if total_length <= 1e-9:
+        with lock:
+            position = list(points[-1])
+            _record_trace_unlocked(position)
+            path_active_segment = -1
+            in_position = True
+            set_move_state(MOVE_DONE, 0, -1)
+        return
+
+    cumulative = [0.0]
+    for length in lengths:
+        cumulative.append(cumulative[-1] + length)
+
+    vmax = max(0.1, float(speed_mm_s))
+    acceleration = max(20.0, vmax * 6.0)
+
+    travelled = 0.0
+    velocity = 0.0
+    previous_time = time.monotonic()
+    seg_index = 0
+
+    while travelled < total_length:
+        now = time.monotonic()
+        dt = max(0.001, min(0.05, now - previous_time))
+        previous_time = now
+
+        with lock:
+            if stop_requested:
+                in_position = False
+                path_active_segment = -1
+                set_move_state(MOVE_STOPPED, 0, -1)
+                return
+
+        remaining = max(0.0, total_length - travelled)
+        braking_velocity = math.sqrt(max(0.0, 2.0 * acceleration * remaining))
+        desired_velocity = min(vmax, braking_velocity)
+
+        if velocity < desired_velocity:
+            velocity = min(desired_velocity, velocity + acceleration * dt)
+        else:
+            velocity = max(desired_velocity, velocity - acceleration * dt)
+
+        if velocity < 1e-6:
+            velocity = min(vmax, acceleration * dt)
+
+        travelled = min(total_length, travelled + velocity * dt)
+
+        while (
+            seg_index < len(lengths) - 1
+            and travelled > cumulative[seg_index + 1]
+        ):
+            seg_index += 1
+
+        seg_start_d = cumulative[seg_index]
+        seg_len = lengths[seg_index]
+        if seg_len <= 1e-12:
+            u = 1.0
+        else:
+            u = (travelled - seg_start_d) / seg_len
+            u = max(0.0, min(1.0, u))
+
+        a = nodes[seg_index]
+        b = nodes[seg_index + 1]
+
+        with lock:
+            position = [
+                a[i] + (b[i] - a[i]) * u
+                for i in range(4)
+            ]
+            path_active_segment = seg_index
+            _record_trace_unlocked(position)
+
+        time.sleep(0.01)
+
+    with lock:
+        position = list(points[-1])
+        _record_trace_unlocked(position)
+        path_active_segment = -1
+        in_position = True
+        set_move_state(MOVE_DONE, 0, -1)
+
+
+def start_path_motion():
+    """Simulator equivalent of PERMPROG CMD21 / START PCPATH."""
+    global stop_requested, target, in_position, path_active_segment
+
+    with lock:
+        if not automatic:
+            return START_MANUAL
+        if move_state == MOVE_RUNNING:
+            return START_BUSY
+        if move_state == MOVE_ERROR:
+            return START_RC_ERROR
+        if alarm:
+            set_move_state(MOVE_ERROR, 144384, 144384)
+            return START_RC_ERROR
+
+        points = [p.copy() for p in path_buffer]
+        speed = float(path_speed_mm_s)
+
+    if not 1 <= len(points) <= 16:
+        return -20
+    if speed <= 0.0:
+        return -21
+
+    try:
+        validate_path(points)
+    except ValueError as exc:
+        with lock:
+            set_move_state(
+                MOVE_ERROR,
+                TRAVEL_RANGE_ERROR,
+                TRAVEL_RANGE_ERROR
+            )
+        print(f"[PCPATH] {exc}")
+        return START_RC_ERROR
+
+    with lock:
+        target = points[-1].copy()
+        stop_requested = False
+        in_position = False
+        path_active_segment = 0
+        set_move_state(MOVE_RUNNING, 0, 1)
+        _record_trace_unlocked(position)
+
+    threading.Thread(
+        target=path_motion_worker,
+        args=(points, speed),
+        daemon=True
+    ).start()
+
+    print(
+        f"[PCPATH] START {len(points)} points, "
+        f"V={speed:.3f} mm/s"
+    )
+    return START_OK
+
+
+
+def _stream_slot_mask_unlocked():
+    occupied = 0
+    free = 0
+
+    for slot_id, slot in enumerate(stream_slots):
+        if slot is None:
+            free |= (1 << slot_id)
+        else:
+            occupied |= (1 << slot_id)
+
+    return occupied, free
+
+
+def upload_stream_slot(slot_id, sequence, points, speed_mm_s, final):
+    """
+    Simulator-only CMD22.
+
+    A slot can be filled only while it is free. The active slot is never
+    overwritten. Sequence numbers make stale/reordered uploads visible.
+    """
+    global stream_slots
+
+    if slot_id not in (0, 1):
+        return STREAM_SLOT_ERROR
+
+    if not 1 <= len(points) <= 16:
+        return -20
+
+    if speed_mm_s <= 0.0:
+        return -21
+
+    if sequence < 0:
+        return STREAM_SEQUENCE_ERROR
+
+    # Endpoint check at upload time. Full segment check is repeated by
+    # the motion worker using the actual predecessor position.
+    for index, point in enumerate(points, start=1):
+        if not xy_reachable(point[0], point[1]):
+            print(
+                f"[STREAM] slot {slot_id} seq={sequence}: "
+                f"P{index} unreachable "
+                f"X={point[0]:.3f} Y={point[1]:.3f}"
+            )
+            return START_RC_ERROR
+
+    with lock:
+        if stream_slots[slot_id] is not None:
+            return STREAM_SLOT_BUSY
+
+        stream_slots[slot_id] = {
+            "seq": int(sequence),
+            "points": [list(p) for p in points],
+            "speed": float(speed_mm_s),
+            "final": bool(final),
+        }
+
+    print(
+        f"[STREAM] upload slot={'AB'[slot_id]} "
+        f"seq={sequence} points={len(points)} "
+        f"V={speed_mm_s:.3f} final={int(bool(final))}"
+    )
+    return STREAM_UPLOAD_OK
+
+
+def _find_stream_slot_for_sequence_unlocked(sequence):
+    for slot_id, slot in enumerate(stream_slots):
+        if slot is not None and slot["seq"] == sequence:
+            return slot_id
+    return -1
+
+
+def _stream_remaining_distance(nodes, segment_index, segment_progress):
+    """
+    Remaining simulator metric from current location to the final point
+    of the current buffer.
+    """
+    if segment_index >= len(nodes) - 1:
+        return 0.0
+
+    current_length = _path_segment_metric(
+        nodes[segment_index],
+        nodes[segment_index + 1]
+    )
+    remaining = max(0.0, current_length - segment_progress)
+
+    for i in range(segment_index + 1, len(nodes) - 1):
+        remaining += _path_segment_metric(nodes[i], nodes[i + 1])
+
+    return remaining
+
+
+def stream_motion_worker():
+    """
+    Simulated two-slot ping-pong stream.
+
+    The velocity is preserved across a buffer boundary if the next sequence
+    is already ready in the other slot. If it is not ready, the simulator
+    raises STREAM_UNDERRUN_ERROR instead of pretending that seamless motion
+    is possible.
+    """
+    global position, target, in_position
+    global stream_running, stream_active_slot, stream_active_seq
+    global stream_completed_seq, stream_underruns, stream_active_segment
+    global stream_slots
+
+    sequence = 0
+    velocity = 0.0
+    acceleration = 120.0  # simulator-only, mm/s^2 equivalent
+
+    while True:
+        with lock:
+            slot_id = _find_stream_slot_for_sequence_unlocked(sequence)
+
+            if slot_id < 0:
+                stream_underruns += 1
+                stream_running = False
+                stream_active_slot = -1
+                stream_active_seq = -1
+                stream_active_segment = -1
+                in_position = False
+                set_move_state(
+                    MOVE_ERROR,
+                    STREAM_UNDERRUN_ERROR,
+                    STREAM_UNDERRUN_ERROR
+                )
+                print(
+                    f"[STREAM] UNDERRUN: sequence {sequence} not ready"
+                )
+                return
+
+            slot = stream_slots[slot_id]
+            points = [p.copy() for p in slot["points"]]
+            speed = float(slot["speed"])
+            final = bool(slot["final"])
+
+            stream_active_slot = slot_id
+            stream_active_seq = sequence
+            stream_active_segment = 0
+            target = points[-1].copy()
+            start = position.copy()
+
+        try:
+            # Validate using the exact current endpoint from the previous block.
+            previous = start
+            for point in points:
+                validate_linear_xy_segment(previous, point, step_mm=2.0)
+                previous = point
+        except ValueError as exc:
+            with lock:
+                stream_running = False
+                stream_active_slot = -1
+                stream_active_seq = -1
+                stream_active_segment = -1
+                in_position = False
+                set_move_state(
+                    MOVE_ERROR,
+                    TRAVEL_RANGE_ERROR,
+                    TRAVEL_RANGE_ERROR
+                )
+            print(f"[STREAM] {exc}")
+            return
+
+        nodes = [start] + points
+        desired_cruise = max(0.1, speed)
+
+        for seg_index in range(len(nodes) - 1):
+            a = nodes[seg_index]
+            b = nodes[seg_index + 1]
+            seg_length = _path_segment_metric(a, b)
+
+            if seg_length <= 1e-12:
+                with lock:
+                    position = b.copy()
+                    stream_active_segment = seg_index
+                    _record_trace_unlocked(position)
+                continue
+
+            progress = 0.0
+            previous_time = time.monotonic()
+
+            while progress < seg_length:
+                now = time.monotonic()
+                dt = max(0.001, min(0.05, now - previous_time))
+                previous_time = now
+
+                with lock:
+                    if stop_requested:
+                        stream_running = False
+                        stream_active_slot = -1
+                        stream_active_seq = -1
+                        stream_active_segment = -1
+                        in_position = False
+                        set_move_state(MOVE_STOPPED, 0, -1)
+                        print("[STREAM] STOPPED")
+                        return
+
+                # Only the final controller buffer is allowed to decelerate
+                # to zero. Intermediate buffers keep their velocity.
+                if final:
+                    remaining = _stream_remaining_distance(
+                        nodes,
+                        seg_index,
+                        progress
+                    )
+                    braking_velocity = math.sqrt(
+                        max(0.0, 2.0 * acceleration * remaining)
+                    )
+                    desired_velocity = min(
+                        desired_cruise,
+                        braking_velocity
+                    )
+                else:
+                    desired_velocity = desired_cruise
+
+                if velocity < desired_velocity:
+                    velocity = min(
+                        desired_velocity,
+                        velocity + acceleration * dt
+                    )
+                else:
+                    velocity = max(
+                        desired_velocity,
+                        velocity - acceleration * dt
+                    )
+
+                if velocity < 1e-6:
+                    velocity = min(
+                        desired_cruise,
+                        acceleration * dt
+                    )
+
+                progress = min(
+                    seg_length,
+                    progress + velocity * dt
+                )
+                u = progress / seg_length
+
+                with lock:
+                    position = [
+                        a[i] + (b[i] - a[i]) * u
+                        for i in range(4)
+                    ]
+                    stream_active_segment = seg_index
+                    _record_trace_unlocked(position)
+
+                time.sleep(0.005)
+
+        # The current buffer has been consumed. Free its slot BEFORE the
+        # next buffer runs, so the PC can refill it while the other slot
+        # is active.
+        with lock:
+            position = points[-1].copy()
+            _record_trace_unlocked(position)
+
+            stream_slots[slot_id] = None
+            stream_completed_seq = sequence
+
+            if final:
+                stream_running = False
+                stream_active_slot = -1
+                stream_active_seq = -1
+                stream_active_segment = -1
+                in_position = True
+                set_move_state(MOVE_DONE, 0, -1)
+                print(
+                    f"[STREAM] DONE seq={sequence} "
+                    f"underruns={stream_underruns}"
+                )
+                return
+
+            # The next slot must ALREADY be ready at the transition.
+            next_sequence = sequence + 1
+            next_slot = _find_stream_slot_for_sequence_unlocked(
+                next_sequence
+            )
+
+            if next_slot < 0:
+                stream_underruns += 1
+                stream_running = False
+                stream_active_slot = -1
+                stream_active_seq = -1
+                stream_active_segment = -1
+                in_position = False
+                set_move_state(
+                    MOVE_ERROR,
+                    STREAM_UNDERRUN_ERROR,
+                    STREAM_UNDERRUN_ERROR
+                )
+                print(
+                    f"[STREAM] UNDERRUN at boundary "
+                    f"{sequence}->{next_sequence}"
+                )
+                return
+
+        sequence += 1
+
+
+def start_stream_motion():
+    global stop_requested, in_position
+    global stream_running, stream_active_slot, stream_active_seq
+    global stream_completed_seq, stream_underruns, stream_active_segment
+
+    with lock:
+        if not automatic:
+            return START_MANUAL
+        if move_state == MOVE_RUNNING or stream_running:
+            return START_BUSY
+        if move_state == MOVE_ERROR:
+            return START_RC_ERROR
+        if alarm:
+            set_move_state(MOVE_ERROR, 144384, 144384)
+            return START_RC_ERROR
+
+        first_slot_id = _find_stream_slot_for_sequence_unlocked(0)
+        if first_slot_id < 0:
+            return STREAM_NOT_READY
+
+        first = stream_slots[first_slot_id]
+
+        # If sequence 0 is not final, preload sequence 1 as well.
+        # This guarantees that the very first transition is protected.
+        if not first["final"]:
+            second_slot_id = _find_stream_slot_for_sequence_unlocked(1)
+            if second_slot_id < 0:
+                return STREAM_NOT_READY
+
+        stop_requested = False
+        in_position = False
+        stream_running = True
+        stream_active_slot = -1
+        stream_active_seq = -1
+        stream_completed_seq = -1
+        stream_underruns = 0
+        stream_active_segment = -1
+        set_move_state(MOVE_RUNNING, 0, 1)
+        _record_trace_unlocked(position)
+
+    threading.Thread(
+        target=stream_motion_worker,
+        daemon=True
+    ).start()
+
+    print("[STREAM] START")
+    return START_OK
+
+
+def get_stream_status():
+    with lock:
+        occupied_mask, free_mask = _stream_slot_mask_unlocked()
+        return (
+            int(stream_running),
+            int(stream_active_slot),
+            int(stream_active_seq),
+            int(stream_completed_seq),
+            int(occupied_mask),
+            int(free_mask),
+            int(stream_underruns),
+            int(stream_active_segment),
+        )
+
+
 def handle_client(conn, addr):
     global target, ptp_speed_factor, linear_speed_mm_s, circular_speed_mm_s
+    global path_speed_mm_s, path_buffer
     global move_state, move_error, procstatus
     global stop_requested
 
@@ -676,6 +1298,88 @@ def handle_client(conn, addr):
                 )
                 conn.sendall(struct.pack("<i", response))
 
+            # CMD 20 - UPLOAD PCPATH BUFFER
+            # Payload after command:
+            #   int32 PATH_COUNT
+            #   float32 PATH_SPEED
+            #   64 x float32 PATHDATA = 16 * (X,Y,Z,R)
+            elif cmd == 20:
+                data = recv_exact(conn, 264)
+                count = struct.unpack("<i", data[0:4])[0]
+                speed_mm_s = struct.unpack("<f", data[4:8])[0]
+                values = struct.unpack("<64f", data[8:264])
+
+                points = []
+                if 1 <= count <= 16:
+                    for i in range(count):
+                        base = i * 4
+                        points.append(list(values[base:base + 4]))
+
+                response = upload_path_buffer(points, speed_mm_s)
+                print(
+                    f"[PCPATH] CMD20 count={count} "
+                    f"V={speed_mm_s:.3f} -> {response}"
+                )
+                conn.sendall(struct.pack("<i", response))
+
+            # CMD 21 - START PCPATH
+            elif cmd == 21:
+                response = start_path_motion()
+                print(f"[PCPATH] CMD21 start -> {response}")
+                conn.sendall(struct.pack("<i", response))
+
+            # CMD 22 - STREAM SLOT UPLOAD (simulator prototype)
+            #
+            # Payload after command:
+            #   int32 slot       0=A, 1=B
+            #   int32 sequence
+            #   int32 count
+            #   int32 final
+            #   float32 speed_mm_s
+            #   64 x float32 = 16*(X,Y,Z,R)
+            elif cmd == 22:
+                data = recv_exact(conn, 276)
+
+                slot_id, sequence, count, final = struct.unpack(
+                    "<iiii",
+                    data[0:16]
+                )
+                speed_mm_s = struct.unpack("<f", data[16:20])[0]
+                values = struct.unpack("<64f", data[20:276])
+
+                points = []
+                if 1 <= count <= 16:
+                    for i in range(count):
+                        base = i * 4
+                        points.append(
+                            list(values[base:base + 4])
+                        )
+
+                response = upload_stream_slot(
+                    slot_id,
+                    sequence,
+                    points,
+                    speed_mm_s,
+                    bool(final)
+                )
+
+                conn.sendall(struct.pack("<i", response))
+
+            # CMD 23 - START STREAM
+            elif cmd == 23:
+                response = start_stream_motion()
+                conn.sendall(struct.pack("<i", response))
+
+            # CMD 24 - STREAM STATUS
+            #
+            # 8 x int32:
+            # running, active_slot, active_seq, completed_seq,
+            # occupied_mask, free_mask, underruns, active_segment
+            elif cmd == 24:
+                conn.sendall(
+                    struct.pack("<8i", *get_stream_status())
+                )
+
             else:
                 print(f"[WARN] Unknown command: {cmd}")
                 # Do not send an arbitrary reply: the real protocol has
@@ -695,6 +1399,7 @@ def console_worker():
     """Simple fault/status injection console."""
     global automatic, alarm, referenced, position
     global move_state, move_error, procstatus
+    global path_buffer, path_speed_mm_s
 
     print("""
 Simulator console:
@@ -706,6 +1411,8 @@ Simulator console:
   pos
   setpos X Y Z R
   state
+  path
+  stream
   cleartrace
   help
 """)
@@ -763,6 +1470,52 @@ Simulator console:
                         f"alarm={alarm}, referenced={referenced}"
                     )
 
+                elif cmd == "path":
+                    print(
+                        f"PCPATH count={len(path_buffer)}, "
+                        f"speed={path_speed_mm_s:.3f} mm/s"
+                    )
+                    for i, p in enumerate(path_buffer, start=1):
+                        print(
+                            f"  P{i:02d}: X={p[0]:.3f} Y={p[1]:.3f} "
+                            f"Z={p[2]:.3f} R={p[3]:.3f}"
+                        )
+
+                elif cmd == "stream":
+                    (
+                        running,
+                        active_slot,
+                        active_seq,
+                        completed_seq,
+                        occupied_mask,
+                        free_mask,
+                        underruns,
+                        active_segment,
+                    ) = get_stream_status()
+
+                    print(
+                        f"STREAM running={running} "
+                        f"active_slot={active_slot} "
+                        f"active_seq={active_seq} "
+                        f"completed_seq={completed_seq} "
+                        f"occupied=0b{occupied_mask:02b} "
+                        f"free=0b{free_mask:02b} "
+                        f"underruns={underruns} "
+                        f"segment={active_segment}"
+                    )
+
+                    for slot_id, slot in enumerate(stream_slots):
+                        if slot is None:
+                            print(f"  {'AB'[slot_id]}: FREE")
+                        else:
+                            print(
+                                f"  {'AB'[slot_id]}: "
+                                f"seq={slot['seq']} "
+                                f"points={len(slot['points'])} "
+                                f"V={slot['speed']:.3f} "
+                                f"final={int(slot['final'])}"
+                            )
+
                 elif cmd == "cleartrace":
                     trajectory.clear()
                     print("Trajectory cleared")
@@ -770,7 +1523,7 @@ Simulator console:
                 elif cmd == "help":
                     print(
                         "auto 0|1, alarm 0|1, ref 0|1, error N, clear, "
-                        "pos, setpos X Y Z R, state, cleartrace"
+                        "pos, setpos X Y Z R, state, path, stream, cleartrace"
                     )
 
                 else:
@@ -902,6 +1655,32 @@ class SimulatorView:
             speed = ptp_speed_factor
             lin_speed = linear_speed_mm_s
             circ_speed = circular_speed_mm_s
+            path_speed = path_speed_mm_s
+            uploaded_path = [p.copy() for p in path_buffer]
+            active_segment = path_active_segment
+            (
+                stream_is_running,
+                stream_slot,
+                stream_seq,
+                stream_done_seq,
+                stream_occupied_mask,
+                stream_free_mask,
+                stream_underrun_count,
+                stream_segment,
+            ) = get_stream_status()
+
+            stream_slot_points = []
+            for slot_id, slot in enumerate(stream_slots):
+                if slot is not None:
+                    stream_slot_points.append(
+                        (
+                            slot_id,
+                            slot["seq"],
+                            [q.copy() for q in slot["points"]],
+                            bool(slot["final"]),
+                        )
+                    )
+
             trace = list(trajectory)
             auto = automatic
             alm = alarm
@@ -910,6 +1689,58 @@ class SimulatorView:
         self.canvas.delete("all")
         self.draw_workspace()
 
+        # Uploaded PCPATH preview (planned polyline).
+        if uploaded_path:
+            preview_points = [p] + uploaded_path
+            coords = []
+            for point in preview_points:
+                cx, cy = self.world_to_canvas(point[0], point[1])
+                coords.extend((cx, cy))
+
+            if len(coords) >= 4:
+                self.canvas.create_line(
+                    *coords,
+                    fill="#94a3b8",
+                    width=1,
+                    dash=(4, 3)
+                )
+
+            for i, point in enumerate(uploaded_path, start=1):
+                cx, cy = self.world_to_canvas(point[0], point[1])
+                radius = 5 if active_segment == i - 1 else 3
+                self.canvas.create_oval(
+                    cx-radius, cy-radius, cx+radius, cy+radius,
+                    outline="#64748b"
+                )
+
+        # STREAM A/B preview. Each uploaded slot is drawn from its
+        # first point onward. The actual TCP trace remains the authoritative
+        # path already executed.
+        for slot_id, seq, slot_points, final in stream_slot_points:
+            if not slot_points:
+                continue
+
+            coords = []
+            for point in slot_points:
+                cx, cy = self.world_to_canvas(point[0], point[1])
+                coords.extend((cx, cy))
+
+            if len(coords) >= 4:
+                self.canvas.create_line(
+                    *coords,
+                    fill="#64748b" if slot_id == 0 else "#a16207",
+                    width=2 if stream_slot == slot_id else 1,
+                    dash=(6, 3)
+                )
+
+            for point in slot_points:
+                cx, cy = self.world_to_canvas(point[0], point[1])
+                self.canvas.create_oval(
+                    cx-2, cy-2, cx+2, cy+2,
+                    outline="#64748b" if slot_id == 0 else "#a16207"
+                )
+
+        # Actual TCP trace.
         if len(trace) >= 2:
             coords = []
             for x, y in trace:
@@ -954,7 +1785,16 @@ class SimulatorView:
                 f"PTP={speed*100.0:.2f}%  LIN={lin_speed:.2f} mm/s  "
                 f"CIRC={circ_speed:.2f} mm/s  "
                 f"AUTO={int(auto)} ALARM={int(alm)} REF={int(ref)}\n"
-                f"A1 limit check: {'ON' if CHECK_A1_LIMIT else 'OFF'}  CMD17: ON  CMD18: ON"
+                f"PCPATH={len(uploaded_path):2d}/16  "
+                f"PATH_V={path_speed:.2f} mm/s  "
+                f"SEG={active_segment + 1 if active_segment >= 0 else 0}\n"
+                f"STREAM={'RUN' if stream_is_running else 'IDLE'}  "
+                f"SLOT={('AB'[stream_slot] if stream_slot in (0,1) else '-')}  "
+                f"SEQ={stream_seq} DONE={stream_done_seq}  "
+                f"FREE=0b{stream_free_mask:02b}  "
+                f"UNDERRUN={stream_underrun_count}\n"
+                f"A1 limit check: {'ON' if CHECK_A1_LIMIT else 'OFF'}  "
+                f"CMD17/18: ON  CMD20/21: ON  CMD22/23/24: ON"
             )
         )
 
