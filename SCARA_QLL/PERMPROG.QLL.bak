@@ -52,7 +52,6 @@ PUBLIC INTEGER: MOVE_ERROR
 EXTERNAL: PCMOVE
 EXTERNAL: PCLINEAR
 EXTERNAL: PCCIRC
-EXTERNAL: PCSMOOTH
 
 
 ; ============================================================
@@ -89,7 +88,6 @@ INTEGER: PROCSTATUS
 INTEGER: PCMOVESTATUS
 INTEGER: LINEARSTATUS
 INTEGER: CIRCSTATUS
-INTEGER: SMOOTHSTATUS
 INTEGER: MOTIONBUSY
 
 INTEGER: MOVE_PROCESS
@@ -133,7 +131,6 @@ Loop:
 ; 1 = PCMOVE
 ; 2 = PCLINEAR
 ; 3 = PCCIRC
-; 4 = PCSMOOTH
 ;
 ; Proces sledujeme i po MOVE_STATE=2, protoze pohybovy program
 ; muze nastavit MOVE_STATE=2 drive, nez CONDITION() prejde na -1
@@ -161,11 +158,6 @@ BEGIN
     IF MOVE_PROCESS=3 THEN
     BEGIN
         PROCSTATUS=CONDITION(PCCIRC)
-    END
-
-    IF MOVE_PROCESS=4 THEN
-    BEGIN
-        PROCSTATUS=CONDITION(PCSMOOTH)
     END
 
     IF PROCSTATUS>100 THEN
@@ -293,7 +285,6 @@ BEGIN
         PCMOVESTATUS=CONDITION(PCMOVE)
         LINEARSTATUS=CONDITION(PCLINEAR)
         CIRCSTATUS=CONDITION(PCCIRC)
-        SMOOTHSTATUS=CONDITION(PCSMOOTH)
 
         ; RC ERROR ma prioritu pred MANUAL/BUSY.
         IF PCMOVESTATUS>100 THEN
@@ -325,16 +316,6 @@ BEGIN
 
         IF RESPONSE=0 THEN
         BEGIN
-            IF SMOOTHSTATUS>100 THEN
-            BEGIN
-                MOVE_STATE=3
-                MOVE_ERROR=SMOOTHSTATUS
-                RESPONSE=-12
-            END
-        END
-
-        IF RESPONSE=0 THEN
-        BEGIN
             IF AUTO_RC=0 THEN
             BEGIN
                 RESPONSE=-10
@@ -346,7 +327,6 @@ BEGIN
             IF PCMOVESTATUS<>-1 THEN MOTIONBUSY=1
             IF LINEARSTATUS<>-1 THEN MOTIONBUSY=1
             IF CIRCSTATUS<>-1 THEN MOTIONBUSY=1
-            IF SMOOTHSTATUS<>-1 THEN MOTIONBUSY=1
 
             IF MOTIONBUSY=1 THEN
             BEGIN
@@ -439,7 +419,6 @@ BEGIN
         IF CONDITION(PCMOVE)<>-1 THEN STOP PCMOVE
         IF CONDITION(PCLINEAR)<>-1 THEN STOP PCLINEAR
         IF CONDITION(PCCIRC)<>-1 THEN STOP PCCIRC
-        IF CONDITION(PCSMOOTH)<>-1 THEN STOP PCSMOOTH
 
         MOVE_STATE=4
         MOVE_ERROR=0
@@ -465,7 +444,6 @@ BEGIN
         PCMOVESTATUS=CONDITION(PCMOVE)
         LINEARSTATUS=CONDITION(PCLINEAR)
         CIRCSTATUS=CONDITION(PCCIRC)
-        SMOOTHSTATUS=CONDITION(PCSMOOTH)
 
         IF PCMOVESTATUS>100 THEN
         BEGIN
@@ -496,16 +474,6 @@ BEGIN
 
         IF RESPONSE=0 THEN
         BEGIN
-            IF SMOOTHSTATUS>100 THEN
-            BEGIN
-                MOVE_STATE=3
-                MOVE_ERROR=SMOOTHSTATUS
-                RESPONSE=-12
-            END
-        END
-
-        IF RESPONSE=0 THEN
-        BEGIN
             IF AUTO_RC=0 THEN
             BEGIN
                 RESPONSE=-10
@@ -517,7 +485,6 @@ BEGIN
             IF PCMOVESTATUS<>-1 THEN MOTIONBUSY=1
             IF LINEARSTATUS<>-1 THEN MOTIONBUSY=1
             IF CIRCSTATUS<>-1 THEN MOTIONBUSY=1
-            IF SMOOTHSTATUS<>-1 THEN MOTIONBUSY=1
 
             IF MOTIONBUSY=1 THEN
             BEGIN
@@ -570,7 +537,6 @@ BEGIN
         PCMOVESTATUS=CONDITION(PCMOVE)
         LINEARSTATUS=CONDITION(PCLINEAR)
         CIRCSTATUS=CONDITION(PCCIRC)
-        SMOOTHSTATUS=CONDITION(PCSMOOTH)
 
         IF PCMOVESTATUS>100 THEN
         BEGIN
@@ -601,16 +567,6 @@ BEGIN
 
         IF RESPONSE=0 THEN
         BEGIN
-            IF SMOOTHSTATUS>100 THEN
-            BEGIN
-                MOVE_STATE=3
-                MOVE_ERROR=SMOOTHSTATUS
-                RESPONSE=-12
-            END
-        END
-
-        IF RESPONSE=0 THEN
-        BEGIN
             IF AUTO_RC=0 THEN
             BEGIN
                 RESPONSE=-10
@@ -622,7 +578,6 @@ BEGIN
             IF PCMOVESTATUS<>-1 THEN MOTIONBUSY=1
             IF LINEARSTATUS<>-1 THEN MOTIONBUSY=1
             IF CIRCSTATUS<>-1 THEN MOTIONBUSY=1
-            IF SMOOTHSTATUS<>-1 THEN MOTIONBUSY=1
 
             IF MOTIONBUSY=1 THEN
             BEGIN
@@ -640,101 +595,6 @@ BEGIN
         END
 
         WRITE WIN_1,RESPONSE
-    END
-
-
-
-    ; --------------------------------------------------------
-    ; CMD 19
-    ; START PCSMOOTH - test PROGR_SLOPE
-    ;
-    ; odpoved:
-    ;  10 = START prijat
-    ; -10 = robot je MANUAL
-    ; -11 = jiny/predchozi motion proces je aktivni
-    ; -12 = nektery motion proces je v RC ERROR
-    ; --------------------------------------------------------
-
-    IF CMD=19 THEN
-    BEGIN
-
-        RESPONSE=0
-        MOTIONBUSY=0
-
-        PCMOVESTATUS=CONDITION(PCMOVE)
-        LINEARSTATUS=CONDITION(PCLINEAR)
-        CIRCSTATUS=CONDITION(PCCIRC)
-        SMOOTHSTATUS=CONDITION(PCSMOOTH)
-
-        IF PCMOVESTATUS>100 THEN
-        BEGIN
-            MOVE_STATE=3
-            MOVE_ERROR=PCMOVESTATUS
-            RESPONSE=-12
-        END
-
-        IF RESPONSE=0 THEN
-        BEGIN
-            IF LINEARSTATUS>100 THEN
-            BEGIN
-                MOVE_STATE=3
-                MOVE_ERROR=LINEARSTATUS
-                RESPONSE=-12
-            END
-        END
-
-        IF RESPONSE=0 THEN
-        BEGIN
-            IF CIRCSTATUS>100 THEN
-            BEGIN
-                MOVE_STATE=3
-                MOVE_ERROR=CIRCSTATUS
-                RESPONSE=-12
-            END
-        END
-
-        IF RESPONSE=0 THEN
-        BEGIN
-            IF SMOOTHSTATUS>100 THEN
-            BEGIN
-                MOVE_STATE=3
-                MOVE_ERROR=SMOOTHSTATUS
-                RESPONSE=-12
-            END
-        END
-
-        IF RESPONSE=0 THEN
-        BEGIN
-            IF AUTO_RC=0 THEN
-            BEGIN
-                RESPONSE=-10
-            END
-        END
-
-        IF RESPONSE=0 THEN
-        BEGIN
-            IF PCMOVESTATUS<>-1 THEN MOTIONBUSY=1
-            IF LINEARSTATUS<>-1 THEN MOTIONBUSY=1
-            IF CIRCSTATUS<>-1 THEN MOTIONBUSY=1
-            IF SMOOTHSTATUS<>-1 THEN MOTIONBUSY=1
-
-            IF MOTIONBUSY=1 THEN
-            BEGIN
-                RESPONSE=-11
-            END
-
-            IF MOTIONBUSY=0 THEN
-            BEGIN
-                MOVE_ERROR=0
-                MOVE_STATE=1
-                MOVE_PROCESS=4
-                START PCSMOOTH
-                RESPONSE=10
-            END
-        END
-
-        WRITE WIN_1,RESPONSE
-
     END
 
 
@@ -765,11 +625,6 @@ BEGIN
         IF MOVE_PROCESS=3 THEN
         BEGIN
             PROCSTATUS=CONDITION(PCCIRC)
-        END
-
-        IF MOVE_PROCESS=4 THEN
-        BEGIN
-            PROCSTATUS=CONDITION(PCSMOOTH)
         END
 
         ; jeste jednou zkontrolujeme RC error,
