@@ -31,7 +31,7 @@ class Rho4:
     PATH_SPEED_ERROR = -21
     PATH_MAX_POINTS = 16
 
-    # STREAM V1 protocol - simulator prototype
+    # STREAM BAPS protocol - compiled PERMPROG compatible
     STREAM_UPLOAD_OK = 22
     STREAM_SLOT_ERROR = -22
     STREAM_SLOT_BUSY = -23
@@ -1175,8 +1175,7 @@ class Rho4:
 
 
     # =========================================================
-    # STREAM V1 - TWO-SLOT PING-PONG (CMD22/23/24)
-    # Simulator prototype.
+    # STREAM BAPS V1 - EXACT COMPILED CMD22 / CMD23 / CMD24
     # =========================================================
 
     def upload_stream_slot(
@@ -1185,56 +1184,67 @@ class Rho4:
         sequence,
         points,
         speed_mm_s,
-        final=False,
         validate_points=True
     ):
+        """
+        CMD22 exact compiled wire format.
+
+        Current BAPS PCBUFA/B and PCENDA/B always execute 16 MOVE blocks,
+        therefore every stream buffer MUST contain exactly 16 valid points.
+        """
         slot = int(slot)
         sequence = int(sequence)
         speed_mm_s = float(speed_mm_s)
 
         if slot not in (0, 1):
-            raise ValueError("STREAM slot musi byt 0 (A) nebo 1 (B)")
+            raise ValueError(
+                "STREAM slot musi byt 0 (A) nebo 1 (B)"
+            )
+
         if sequence < 0:
-            raise ValueError("STREAM sequence musi byt >= 0")
-        if speed_mm_s <= 0:
-            raise ValueError("STREAM speed musi byt > 0 mm/s")
+            raise ValueError(
+                "STREAM sequence musi byt >= 0"
+            )
+
+        if speed_mm_s <= 0.0:
+            raise ValueError(
+                "STREAM speed musi byt > 0 mm/s"
+            )
 
         normalized = [
             self._normalize_path_point(point)
             for point in points
         ]
 
-        if not 1 <= len(normalized) <= self.PATH_MAX_POINTS:
-            raise ValueError("STREAM buffer podporuje 1..16 bodu")
+        if len(normalized) != 16:
+            raise ValueError(
+                "STREAM BAPS V1 vyzaduje presne 16 bodu "
+                "v kazdem bufferu"
+            )
 
         if validate_points:
-            # Endpoint validation only. Full continuous-path validation for
-            # an arbitrarily long stream will be added before real RHO4 use.
             for point in normalized:
                 self.check_target(*point)
 
-        padded = list(normalized)
-        while len(padded) < self.PATH_MAX_POINTS:
-            padded.append((0.0, 0.0, 0.0, 0.0))
-
         flat = []
-        for point in padded:
+        for point in normalized:
             flat.extend(point)
 
+        # cmd, slot, sequence, speed, 64 floats
         payload = struct.pack(
-            "<iiiiif64f",
+            "<iiif64f",
             22,
             slot,
             sequence,
-            len(normalized),
-            int(bool(final)),
             speed_mm_s,
             *flat
         )
 
         with self._lock:
             if self.sock is None:
-                raise ConnectionError("Nejsi pripojen k RHO")
+                raise ConnectionError(
+                    "Nejsi pripojen k RHO"
+                )
 
             self.sock.sendall(payload)
             response = struct.unpack(
@@ -1242,34 +1252,57 @@ class Rho4:
                 self._recv_exact(4)
             )[0]
 
-        if response == self.STREAM_UPLOAD_OK:
+        if response == 22:
             return True
 
-        if response == self.STREAM_SLOT_ERROR:
-            raise RuntimeError("STREAM: neplatny slot")
-
-        if response == self.STREAM_SLOT_BUSY:
+        if response == -21:
             raise RuntimeError(
-                f"STREAM: slot {'AB'[slot]} jeste neni volny"
+                "STREAM CMD22: speed <= 0"
             )
 
-        if response == self.PATH_COUNT_ERROR:
-            raise RuntimeError("STREAM: count mimo 1..16")
+        if response == -22:
+            raise RuntimeError(
+                "STREAM CMD22: neplatny slot"
+            )
 
-        if response == self.PATH_SPEED_ERROR:
-            raise RuntimeError("STREAM: speed <= 0")
+        if response == -23:
+            raise RuntimeError(
+                f"STREAM CMD22: slot {'AB'[slot]} neni FREE"
+            )
 
         if response == self.START_RC_ERROR:
-            raise RuntimeError("STREAM: bod mimo simulator workspace")
+            raise RuntimeError(
+                "STREAM CMD22: simulator odmitl bod mimo workspace"
+            )
 
         raise RuntimeError(
             f"STREAM CMD22 neznamy response={response}"
         )
 
 
-    def start_stream(self):
+    def start_stream(self, block_count):
+        """
+        CMD23 exact compiled wire format:
+          int32 command 23
+          int32 STR_BLOCKS
+        """
+        block_count = int(block_count)
+
+        if not 1 <= block_count <= 8:
+            raise ValueError(
+                "STREAM block_count musi byt 1..8"
+            )
+
         with self._lock:
-            self._send_cmd(23)
+            if self.sock is None:
+                raise ConnectionError(
+                    "Nejsi pripojen k RHO"
+                )
+
+            self.sock.sendall(
+                struct.pack("<ii", 23, block_count)
+            )
+
             response = struct.unpack(
                 "<i",
                 self._recv_exact(4)
@@ -1279,22 +1312,33 @@ class Rho4:
             return True
 
         if response == self.START_MANUAL:
-            raise RuntimeError("STREAM: robot neni v AUTO")
+            raise RuntimeError(
+                "STREAM: robot neni v AUTO"
+            )
 
         if response == self.START_BUSY:
-            raise RuntimeError("STREAM: pohyb uz probiha")
+            raise RuntimeError(
+                "STREAM: jiny motion proces je aktivni"
+            )
 
         if response == self.START_RC_ERROR:
-            state, error, procstatus = self.get_move_state()
+            state, error, procstatus = (
+                self.get_move_state()
+            )
             raise RuntimeError(
                 f"STREAM RC error: {error} "
                 f"(ProcStatus={procstatus})"
             )
 
-        if response == self.STREAM_NOT_READY:
+        if response == -20:
             raise RuntimeError(
-                "STREAM: pred START musi byt pripraven seq0 "
-                "a u vicebufferove drahy take seq1"
+                "STREAM: STR_BLOCKS musi byt 1..8"
+            )
+
+        if response == -24:
+            raise RuntimeError(
+                "STREAM: pocatecni A/B buffery nejsou READY "
+                "(seq0/seq1)"
             )
 
         raise RuntimeError(
@@ -1303,71 +1347,98 @@ class Rho4:
 
 
     def get_stream_status(self):
+        """
+        CMD24 exact compiled reply:
+          A_FREE, B_FREE, A_SEQ, B_SEQ,
+          STR_BLOCKS, PROCSTATUS
+        """
         with self._lock:
             self._send_cmd(24)
-            data = self._recv_exact(32)
-            (
-                running,
-                active_slot,
-                active_seq,
-                completed_seq,
-                occupied_mask,
-                free_mask,
-                underruns,
-                active_segment,
-            ) = struct.unpack("<8i", data)
+            data = self._recv_exact(24)
+
+        (
+            a_free,
+            b_free,
+            a_seq,
+            b_seq,
+            block_count,
+            stream_procstatus,
+        ) = struct.unpack("<6i", data)
 
         return {
-            "running": bool(running),
-            "active_slot": active_slot,
-            "active_seq": active_seq,
-            "completed_seq": completed_seq,
-            "occupied_mask": occupied_mask,
-            "free_mask": free_mask,
-            "underruns": underruns,
-            "active_segment": active_segment,
+            "a_free": bool(a_free),
+            "b_free": bool(b_free),
+            "a_seq": a_seq,
+            "b_seq": b_seq,
+            "block_count": block_count,
+            "procstatus": stream_procstatus,
         }
 
 
-    def stream_blocks(
+    def clear_stream(self):
+        """
+        CMD25 - clear A/B slot state without motion.
+
+        The BAPS side refuses this while PCSTREAM is active.
+        """
+        with self._lock:
+            self._send_cmd(25)
+            response = struct.unpack(
+                "<i", self._recv_exact(4)
+            )[0]
+
+        if response == 25:
+            return True
+
+        if response == self.START_BUSY:
+            raise RuntimeError(
+                "STREAM CMD25: PCSTREAM je stale aktivni"
+            )
+
+        raise RuntimeError(
+            f"STREAM CMD25 neznamy response={response}"
+        )
+
+
+    def check_stream_path(
         self,
         blocks,
-        timeout=120.0,
-        poll_interval=0.01,
-        validate_points=True
+        step_mm=2.0,
+        joint_step_limit=10.0,
+        angular_step_deg=5.0
     ):
         """
-        Execute an ordered list of stream blocks by ping-ponging slots A/B.
+        Full dry-run of the COMPLETE stream, including transitions between
+        controller buffers. The IK branch is kept continuous across all
+        16-point boundaries.
 
-        block format:
-          {
-            "points": [(x,y,z,r), ...],   # 1..16
-            "speed_mm_s": 20.0
-          }
-
-        First two blocks are preloaded. While one slot is ACTIVE and the
-        other is READY, Python refills the just-freed slot with the next
-        sequence.
+        Returns diagnostic information; it does not move the robot.
         """
-        if not blocks:
-            raise ValueError("STREAM blocks nesmi byt prazdne")
+        if step_mm <= 0:
+            raise ValueError("step_mm musi byt > 0")
+        if joint_step_limit <= 0:
+            raise ValueError("joint_step_limit musi byt > 0")
+        if angular_step_deg <= 0:
+            raise ValueError("angular_step_deg musi byt > 0")
+        if not 1 <= len(blocks) <= 8:
+            raise ValueError("STREAM vyzaduje 1..8 bufferu")
 
         normalized_blocks = []
-
-        for index, block in enumerate(blocks):
+        for block_index, block in enumerate(blocks):
             points = [
-                self._normalize_path_point(point)
-                for point in block["points"]
+                self._normalize_path_point(p)
+                for p in block["points"]
             ]
             speed = float(block["speed_mm_s"])
 
-            if not 1 <= len(points) <= self.PATH_MAX_POINTS:
+            if len(points) != 16:
                 raise ValueError(
-                    f"STREAM block {index}: musi mit 1..16 bodu"
+                    f"STREAM buffer {block_index}: "
+                    "musi obsahovat presne 16 bodu"
                 )
-            if speed <= 0:
+            if speed <= 0.0:
                 raise ValueError(
-                    f"STREAM block {index}: speed musi byt > 0"
+                    f"STREAM buffer {block_index}: speed musi byt > 0"
                 )
 
             normalized_blocks.append({
@@ -1375,65 +1446,300 @@ class Rho4:
                 "speed_mm_s": speed,
             })
 
-        # Initial preload.
+        sx, sy, sz, sr = self.get_position()
+        ca1, ca2, ca3, ca4 = self.get_joint_position()
+
+        previous_xyzr = (sx, sy, sz, sr)
+        previous_joint = {
+            "a1": ca1,
+            "a2": ca2,
+            "a3": ca3,
+            "a4": ca4,
+        }
+
+        segment_count = 0
+        sample_count = 0
+        total_xyz_mm = 0.0
+        block_lengths = []
+
+        for block_index, block in enumerate(normalized_blocks):
+            block_length = 0.0
+
+            for point_index, dest in enumerate(block["points"]):
+                ax, ay, az, ar = previous_xyzr
+                bx, by, bz, br_raw = dest
+
+                dx = bx - ax
+                dy = by - ay
+                dz = bz - az
+                dr = self._angle_delta_deg(br_raw, ar)
+
+                length = math.sqrt(dx*dx + dy*dy + dz*dz)
+                total_xyz_mm += length
+                block_length += length
+
+                xyz_samples = int(math.ceil(length / step_mm))
+                r_samples = int(
+                    math.ceil(abs(dr) / angular_step_deg)
+                )
+                samples = max(1, xyz_samples, r_samples)
+
+                for sample_index in range(1, samples + 1):
+                    t = sample_index / samples
+                    px = ax + dx * t
+                    py = ay + dy * t
+                    pz = az + dz * t
+                    pr = ar + dr * t
+
+                    solutions = self.check_target(px, py, pz, pr)
+
+                    def distance(sol):
+                        da1 = self._angle_delta_deg(
+                            sol["a1"], previous_joint["a1"]
+                        )
+                        da2 = self._angle_delta_deg(
+                            sol["a2"], previous_joint["a2"]
+                        )
+                        da4 = self._angle_delta_deg(
+                            sol["a4"], previous_joint["a4"]
+                        )
+                        return da1*da1 + da2*da2 + da4*da4
+
+                    selected = min(solutions, key=distance)
+
+                    da1 = abs(self._angle_delta_deg(
+                        selected["a1"], previous_joint["a1"]
+                    ))
+                    da2 = abs(self._angle_delta_deg(
+                        selected["a2"], previous_joint["a2"]
+                    ))
+                    da4 = abs(self._angle_delta_deg(
+                        selected["a4"], previous_joint["a4"]
+                    ))
+
+                    if max(da1, da2, da4) > joint_step_limit:
+                        raise ValueError(
+                            "STREAM preflight: joint jump, "
+                            f"buffer={block_index} "
+                            f"point={point_index + 1} "
+                            f"t={t:.3f}: "
+                            f"dA1={da1:.2f} "
+                            f"dA2={da2:.2f} "
+                            f"dA4={da4:.2f}"
+                        )
+
+                    previous_joint = selected
+                    sample_count += 1
+
+                previous_xyzr = (bx, by, bz, br_raw)
+                segment_count += 1
+
+            block_lengths.append(block_length)
+
+        return {
+            "blocks": len(normalized_blocks),
+            "points": len(normalized_blocks) * 16,
+            "segments": segment_count,
+            "samples": sample_count,
+            "xyz_length_mm": total_xyz_mm,
+            "block_lengths_mm": block_lengths,
+            "start": (sx, sy, sz, sr),
+            "end": previous_xyzr,
+        }
+
+
+    @staticmethod
+    def estimate_refill_windows(blocks, lookahead_blocks=11):
+        """
+        Conservative timing estimate for A/B refill.
+
+        RHO4 look-ahead is treated as 11 prepared motion blocks. With a
+        16-point controller buffer this leaves roughly 5 point-to-point
+        intervals as a conservative refill opportunity in the intervening
+        buffer. This is a diagnostic estimate, not a controller guarantee.
+        """
+        if lookahead_blocks < 0 or lookahead_blocks >= 16:
+            raise ValueError("lookahead_blocks musi byt 0..15")
+
+        guard_segments = 16 - int(lookahead_blocks)
+        windows = []
+
+        # After seq N frees its slot, seq N+1 is the intervening buffer
+        # during which seq N+2 must be uploaded into the freed slot.
+        for intervening_seq in range(1, len(blocks) - 1):
+            block = blocks[intervening_seq]
+            points = [tuple(map(float, p)) for p in block["points"]]
+            speed = float(block["speed_mm_s"])
+
+            if speed <= 0.0:
+                continue
+
+            # We do not know the predecessor endpoint here, so use the first
+            # guard_segments internal intervals only. This deliberately errs
+            # on the conservative side.
+            length = 0.0
+            usable = min(guard_segments, max(0, len(points) - 1))
+            for i in range(usable):
+                a = points[i]
+                b = points[i + 1]
+                dx = b[0] - a[0]
+                dy = b[1] - a[1]
+                dz = b[2] - a[2]
+                length += math.sqrt(dx*dx + dy*dy + dz*dz)
+
+            windows.append({
+                "intervening_seq": intervening_seq,
+                "refill_seq": intervening_seq + 1,
+                "guard_segments": usable,
+                "length_mm": length,
+                "window_s": length / speed,
+            })
+
+        return windows
+
+
+    def stream_blocks(
+        self,
+        blocks,
+        timeout=120.0,
+        poll_interval=0.01,
+        validate_points=True,
+        full_preflight=True,
+        min_refill_window_s=0.50,
+        clear_before_start=True
+    ):
+        """
+        Ping-pong executor matching static PCSTREAM.QLL.
+
+        Required mapping:
+          seq0 -> A
+          seq1 -> B
+          seq2 -> A
+          seq3 -> B
+          ...
+
+        All blocks must contain exactly 16 points.
+        Maximum is 8 blocks in current BAPS prototype.
+        """
+        if not 1 <= len(blocks) <= 8:
+            raise ValueError(
+                "STREAM vyzaduje 1..8 bufferu"
+            )
+
+        normalized = []
+
+        if clear_before_start:
+            state, error, procstatus = self.get_move_state()
+            if state == self.MOVE_RUNNING:
+                raise RuntimeError(
+                    "STREAM: nelze CMD25, pohyb je aktivni"
+                )
+            self.clear_stream()
+
+        for seq, block in enumerate(blocks):
+            points = [
+                self._normalize_path_point(point)
+                for point in block["points"]
+            ]
+            speed = float(block["speed_mm_s"])
+
+            if len(points) != 16:
+                raise ValueError(
+                    f"STREAM seq{seq}: buffer musi mit "
+                    "presne 16 bodu"
+                )
+
+            if speed <= 0.0:
+                raise ValueError(
+                    f"STREAM seq{seq}: speed musi byt > 0"
+                )
+
+            normalized.append({
+                "points": points,
+                "speed_mm_s": speed,
+            })
+
+        if full_preflight:
+            report = self.check_stream_path(normalized)
+            print(
+                "STREAM PREFLIGHT OK: "
+                f"{report['blocks']} bufferu, "
+                f"{report['points']} bodu, "
+                f"delka={report['xyz_length_mm']:.2f} mm"
+            )
+
+        refill_windows = self.estimate_refill_windows(normalized)
+        if refill_windows:
+            minimum = min(w["window_s"] for w in refill_windows)
+            print(
+                "STREAM refill guard estimate: "
+                f"min {minimum:.3f} s "
+                "(conservative, 11-block lookahead model)"
+            )
+            if minimum < float(min_refill_window_s):
+                raise RuntimeError(
+                    "STREAM: odhadovane refill okno je jen "
+                    f"{minimum:.3f} s, minimum je "
+                    f"{float(min_refill_window_s):.3f} s"
+                )
+
+        # Preload seq0=A and, when needed, seq1=B.
         self.upload_stream_slot(
             0,
             0,
-            normalized_blocks[0]["points"],
-            normalized_blocks[0]["speed_mm_s"],
-            final=(len(normalized_blocks) == 1),
+            normalized[0]["points"],
+            normalized[0]["speed_mm_s"],
             validate_points=validate_points,
         )
 
-        next_to_upload = 1
+        next_seq = 1
 
-        if len(normalized_blocks) >= 2:
+        if len(normalized) >= 2:
             self.upload_stream_slot(
                 1,
                 1,
-                normalized_blocks[1]["points"],
-                normalized_blocks[1]["speed_mm_s"],
-                final=(len(normalized_blocks) == 2),
+                normalized[1]["points"],
+                normalized[1]["speed_mm_s"],
                 validate_points=validate_points,
             )
-            next_to_upload = 2
+            next_seq = 2
 
-        self.start_stream()
+        self.start_stream(len(normalized))
 
         started = time.monotonic()
-        last_print = None
+        last_display = None
 
         while True:
-            state, error, procstatus = self.get_move_state()
+            state, error, procstatus = (
+                self.get_move_state()
+            )
             status = self.get_stream_status()
 
             display = (
                 state,
                 error,
                 procstatus,
-                status["active_slot"],
-                status["active_seq"],
-                status["completed_seq"],
-                status["free_mask"],
-                status["underruns"],
+                status["a_free"],
+                status["b_free"],
+                status["a_seq"],
+                status["b_seq"],
+                status["procstatus"],
+                next_seq,
             )
 
-            if display != last_print:
-                slot_name = (
-                    "AB"[status["active_slot"]]
-                    if status["active_slot"] in (0, 1)
-                    else "-"
-                )
+            if display != last_display:
                 print(
                     "STREAM "
-                    f"state={state} err={error} proc={procstatus} "
-                    f"slot={slot_name} "
-                    f"seq={status['active_seq']} "
-                    f"done={status['completed_seq']} "
-                    f"free=0b{status['free_mask']:02b} "
-                    f"underrun={status['underruns']}"
+                    f"state={state} err={error} "
+                    f"proc={procstatus} "
+                    f"A_FREE={int(status['a_free'])} "
+                    f"B_FREE={int(status['b_free'])} "
+                    f"A_SEQ={status['a_seq']} "
+                    f"B_SEQ={status['b_seq']} "
+                    f"PCSTREAM={status['procstatus']} "
+                    f"next={next_seq}"
                 )
-                last_print = display
+                last_display = display
 
             if state == self.MOVE_ERROR:
                 raise RuntimeError(
@@ -1443,61 +1749,74 @@ class Rho4:
             if state == self.MOVE_STOPPED:
                 return False
 
-            # Refill any newly freed slot. There can be at most one useful
-            # refill at a time in a two-slot ping-pong scheme.
-            if next_to_upload < len(normalized_blocks):
-                free_mask = status["free_mask"]
+            # Static PCSTREAM alternates slots by sequence parity.
+            if next_seq < len(normalized):
+                slot = next_seq & 1
+                free = (
+                    status["a_free"]
+                    if slot == 0
+                    else status["b_free"]
+                )
 
-                free_slot = None
-                if free_mask & 0b01:
-                    free_slot = 0
-                elif free_mask & 0b10:
-                    free_slot = 1
+                if free:
+                    block = normalized[next_seq]
 
-                if free_slot is not None:
-                    block = normalized_blocks[next_to_upload]
-                    final = (
-                        next_to_upload
-                        == len(normalized_blocks) - 1
-                    )
-
+                    refill_t0 = time.monotonic()
                     self.upload_stream_slot(
-                        free_slot,
-                        next_to_upload,
+                        slot,
+                        next_seq,
                         block["points"],
                         block["speed_mm_s"],
-                        final=final,
                         validate_points=validate_points,
                     )
+                    refill_ms = (time.monotonic() - refill_t0) * 1000.0
 
-                    print(
-                        f"  refill {'AB'[free_slot]} "
-                        f"<- seq {next_to_upload} "
-                        f"({len(block['points'])} bodu)"
+                    verify = self.get_stream_status()
+                    verify_seq = (
+                        verify["a_seq"] if slot == 0
+                        else verify["b_seq"]
+                    )
+                    verify_free = (
+                        verify["a_free"] if slot == 0
+                        else verify["b_free"]
                     )
 
-                    next_to_upload += 1
-                    # Fetch a fresh status before another upload.
+                    if verify_seq != next_seq or verify_free:
+                        try:
+                            self.stop()
+                        finally:
+                            raise RuntimeError(
+                                "STREAM refill verify failed: "
+                                f"slot={'AB'[slot]} "
+                                f"wanted_seq={next_seq} "
+                                f"got_seq={verify_seq} "
+                                f"free={int(verify_free)}"
+                            )
+
+                    print(
+                        f"  REFILL {'AB'[slot]} "
+                        f"<- seq{next_seq}  "
+                        f"ACK={refill_ms:.1f} ms"
+                    )
+
+                    next_seq += 1
                     continue
 
             if (
                 state == self.MOVE_DONE
                 and procstatus == -1
-                and not status["running"]
             ):
-                if status["underruns"] != 0:
-                    raise RuntimeError(
-                        f"STREAM skoncil s underrun="
-                        f"{status['underruns']}"
-                    )
                 return True
 
             if time.monotonic() - started > timeout:
                 raise TimeoutError(
-                    "STREAM nedokoncil drahu v casovem limitu"
+                    "STREAM nedokoncil drahu "
+                    "v casovem limitu"
                 )
 
-            time.sleep(max(0.001, float(poll_interval)))
+            time.sleep(
+                max(0.001, float(poll_interval))
+            )
 
 
     # =========================================================

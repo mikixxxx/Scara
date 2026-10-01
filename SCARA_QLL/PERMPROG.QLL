@@ -44,6 +44,39 @@ PUBLIC INTEGER: MOVE_STATE
 ; 0 = bez chyby
 PUBLIC INTEGER: MOVE_ERROR
 
+; ============================================================
+; PCPATH BUFFER V1
+; ============================================================
+; PATH_COUNT = 1..16
+; PATH_SPEED = mm/s
+; PATHDATA = 16 x (X,Y,Z,R), absolutni souradnice
+PUBLIC INTEGER: PATH_COUNT
+PUBLIC REAL: PATH_SPEED
+PUBLIC ARRAY [1..64] REAL: PATHDATA
+
+; ============================================================
+; PCSTREAM DOUBLE BUFFER - COMPILE PROTOTYPE
+; ============================================================
+; Fixed 16 POINTs per slot for the first real-RHO proof.
+; A/B data are POINT arrays so PCBUFA/PCBUFB can MOVE directly
+; without copying 64 REAL values immediately before motion.
+PUBLIC ARRAY [1..16] POINT: SA_DATA
+PUBLIC ARRAY [1..16] POINT: SB_DATA
+
+PUBLIC REAL: SA_SPEED
+PUBLIC REAL: SB_SPEED
+
+PUBLIC INTEGER: SA_SEQ
+PUBLIC INTEGER: SB_SEQ
+
+; 1 = PC may write this slot, 0 = reserved/ready/in use
+PUBLIC INTEGER: SA_FREE
+PUBLIC INTEGER: SB_FREE
+
+; Total number of 16-point buffers for the current stream.
+; First prototype supports 1..8 buffers.
+PUBLIC INTEGER: STR_BLOCKS
+
 
 ; ============================================================
 ; EXTERNI PROCES
@@ -53,6 +86,8 @@ EXTERNAL: PCMOVE
 EXTERNAL: PCLINEAR
 EXTERNAL: PCCIRC
 EXTERNAL: PCSMOOTH
+EXTERNAL: PCPATH
+EXTERNAL: PCSTREAM
 
 
 ; ============================================================
@@ -90,9 +125,16 @@ INTEGER: PCMOVESTATUS
 INTEGER: LINEARSTATUS
 INTEGER: CIRCSTATUS
 INTEGER: SMOOTHSTATUS
+INTEGER: PATHSTATUS
+INTEGER: STREAMSTATUS
 INTEGER: MOTIONBUSY
 
 INTEGER: MOVE_PROCESS
+INTEGER: PATHIDX
+INTEGER: STR_SLOT
+INTEGER: STR_SEQ
+INTEGER: STR_ACCEPT
+REAL: STR_DUMMY
 POINT: ACTPOS
 JC_POINT: @ACTJOINT
 
@@ -121,6 +163,15 @@ CIRC_SPEED=10.0
 PROCSTATUS=-1
 MOTIONBUSY=0
 MOVE_PROCESS=0
+PATH_COUNT=0
+PATH_SPEED=5.0
+SA_SPEED=5.0
+SB_SPEED=5.0
+SA_SEQ=-1
+SB_SEQ=-1
+SA_FREE=1
+SB_FREE=1
+STR_BLOCKS=0
 Loop:
 
 
@@ -134,6 +185,8 @@ Loop:
 ; 2 = PCLINEAR
 ; 3 = PCCIRC
 ; 4 = PCSMOOTH
+; 5 = PCPATH
+; 6 = PCSTREAM
 ;
 ; Proces sledujeme i po MOVE_STATE=2, protoze pohybovy program
 ; muze nastavit MOVE_STATE=2 drive, nez CONDITION() prejde na -1
@@ -166,6 +219,16 @@ BEGIN
     IF MOVE_PROCESS=4 THEN
     BEGIN
         PROCSTATUS=CONDITION(PCSMOOTH)
+    END
+
+    IF MOVE_PROCESS=5 THEN
+    BEGIN
+        PROCSTATUS=CONDITION(PCPATH)
+    END
+
+    IF MOVE_PROCESS=6 THEN
+    BEGIN
+        PROCSTATUS=CONDITION(PCSTREAM)
     END
 
     IF PROCSTATUS>100 THEN
@@ -294,6 +357,8 @@ BEGIN
         LINEARSTATUS=CONDITION(PCLINEAR)
         CIRCSTATUS=CONDITION(PCCIRC)
         SMOOTHSTATUS=CONDITION(PCSMOOTH)
+        PATHSTATUS=CONDITION(PCPATH)
+        STREAMSTATUS=CONDITION(PCSTREAM)
 
         ; RC ERROR ma prioritu pred MANUAL/BUSY.
         IF PCMOVESTATUS>100 THEN
@@ -335,6 +400,26 @@ BEGIN
 
         IF RESPONSE=0 THEN
         BEGIN
+            IF PATHSTATUS>100 THEN
+            BEGIN
+                MOVE_STATE=3
+                MOVE_ERROR=PATHSTATUS
+                RESPONSE=-12
+            END
+        END
+
+        IF RESPONSE=0 THEN
+        BEGIN
+            IF STREAMSTATUS>100 THEN
+            BEGIN
+                MOVE_STATE=3
+                MOVE_ERROR=STREAMSTATUS
+                RESPONSE=-12
+            END
+        END
+
+        IF RESPONSE=0 THEN
+        BEGIN
             IF AUTO_RC=0 THEN
             BEGIN
                 RESPONSE=-10
@@ -347,6 +432,8 @@ BEGIN
             IF LINEARSTATUS<>-1 THEN MOTIONBUSY=1
             IF CIRCSTATUS<>-1 THEN MOTIONBUSY=1
             IF SMOOTHSTATUS<>-1 THEN MOTIONBUSY=1
+            IF PATHSTATUS<>-1 THEN MOTIONBUSY=1
+            IF STREAMSTATUS<>-1 THEN MOTIONBUSY=1
 
             IF MOTIONBUSY=1 THEN
             BEGIN
@@ -440,6 +527,8 @@ BEGIN
         IF CONDITION(PCLINEAR)<>-1 THEN STOP PCLINEAR
         IF CONDITION(PCCIRC)<>-1 THEN STOP PCCIRC
         IF CONDITION(PCSMOOTH)<>-1 THEN STOP PCSMOOTH
+        IF CONDITION(PCPATH)<>-1 THEN STOP PCPATH
+        IF CONDITION(PCSTREAM)<>-1 THEN STOP PCSTREAM
 
         MOVE_STATE=4
         MOVE_ERROR=0
@@ -466,6 +555,8 @@ BEGIN
         LINEARSTATUS=CONDITION(PCLINEAR)
         CIRCSTATUS=CONDITION(PCCIRC)
         SMOOTHSTATUS=CONDITION(PCSMOOTH)
+        PATHSTATUS=CONDITION(PCPATH)
+        STREAMSTATUS=CONDITION(PCSTREAM)
 
         IF PCMOVESTATUS>100 THEN
         BEGIN
@@ -506,6 +597,26 @@ BEGIN
 
         IF RESPONSE=0 THEN
         BEGIN
+            IF PATHSTATUS>100 THEN
+            BEGIN
+                MOVE_STATE=3
+                MOVE_ERROR=PATHSTATUS
+                RESPONSE=-12
+            END
+        END
+
+        IF RESPONSE=0 THEN
+        BEGIN
+            IF STREAMSTATUS>100 THEN
+            BEGIN
+                MOVE_STATE=3
+                MOVE_ERROR=STREAMSTATUS
+                RESPONSE=-12
+            END
+        END
+
+        IF RESPONSE=0 THEN
+        BEGIN
             IF AUTO_RC=0 THEN
             BEGIN
                 RESPONSE=-10
@@ -518,6 +629,8 @@ BEGIN
             IF LINEARSTATUS<>-1 THEN MOTIONBUSY=1
             IF CIRCSTATUS<>-1 THEN MOTIONBUSY=1
             IF SMOOTHSTATUS<>-1 THEN MOTIONBUSY=1
+            IF PATHSTATUS<>-1 THEN MOTIONBUSY=1
+            IF STREAMSTATUS<>-1 THEN MOTIONBUSY=1
 
             IF MOTIONBUSY=1 THEN
             BEGIN
@@ -571,6 +684,8 @@ BEGIN
         LINEARSTATUS=CONDITION(PCLINEAR)
         CIRCSTATUS=CONDITION(PCCIRC)
         SMOOTHSTATUS=CONDITION(PCSMOOTH)
+        PATHSTATUS=CONDITION(PCPATH)
+        STREAMSTATUS=CONDITION(PCSTREAM)
 
         IF PCMOVESTATUS>100 THEN
         BEGIN
@@ -611,6 +726,26 @@ BEGIN
 
         IF RESPONSE=0 THEN
         BEGIN
+            IF PATHSTATUS>100 THEN
+            BEGIN
+                MOVE_STATE=3
+                MOVE_ERROR=PATHSTATUS
+                RESPONSE=-12
+            END
+        END
+
+        IF RESPONSE=0 THEN
+        BEGIN
+            IF STREAMSTATUS>100 THEN
+            BEGIN
+                MOVE_STATE=3
+                MOVE_ERROR=STREAMSTATUS
+                RESPONSE=-12
+            END
+        END
+
+        IF RESPONSE=0 THEN
+        BEGIN
             IF AUTO_RC=0 THEN
             BEGIN
                 RESPONSE=-10
@@ -623,6 +758,8 @@ BEGIN
             IF LINEARSTATUS<>-1 THEN MOTIONBUSY=1
             IF CIRCSTATUS<>-1 THEN MOTIONBUSY=1
             IF SMOOTHSTATUS<>-1 THEN MOTIONBUSY=1
+            IF PATHSTATUS<>-1 THEN MOTIONBUSY=1
+            IF STREAMSTATUS<>-1 THEN MOTIONBUSY=1
 
             IF MOTIONBUSY=1 THEN
             BEGIN
@@ -665,6 +802,8 @@ BEGIN
         LINEARSTATUS=CONDITION(PCLINEAR)
         CIRCSTATUS=CONDITION(PCCIRC)
         SMOOTHSTATUS=CONDITION(PCSMOOTH)
+        PATHSTATUS=CONDITION(PCPATH)
+        STREAMSTATUS=CONDITION(PCSTREAM)
 
         IF PCMOVESTATUS>100 THEN
         BEGIN
@@ -705,6 +844,26 @@ BEGIN
 
         IF RESPONSE=0 THEN
         BEGIN
+            IF PATHSTATUS>100 THEN
+            BEGIN
+                MOVE_STATE=3
+                MOVE_ERROR=PATHSTATUS
+                RESPONSE=-12
+            END
+        END
+
+        IF RESPONSE=0 THEN
+        BEGIN
+            IF STREAMSTATUS>100 THEN
+            BEGIN
+                MOVE_STATE=3
+                MOVE_ERROR=STREAMSTATUS
+                RESPONSE=-12
+            END
+        END
+
+        IF RESPONSE=0 THEN
+        BEGIN
             IF AUTO_RC=0 THEN
             BEGIN
                 RESPONSE=-10
@@ -717,6 +876,8 @@ BEGIN
             IF LINEARSTATUS<>-1 THEN MOTIONBUSY=1
             IF CIRCSTATUS<>-1 THEN MOTIONBUSY=1
             IF SMOOTHSTATUS<>-1 THEN MOTIONBUSY=1
+            IF PATHSTATUS<>-1 THEN MOTIONBUSY=1
+            IF STREAMSTATUS<>-1 THEN MOTIONBUSY=1
 
             IF MOTIONBUSY=1 THEN
             BEGIN
@@ -731,6 +892,579 @@ BEGIN
                 START PCSMOOTH
                 RESPONSE=10
             END
+        END
+
+        WRITE WIN_1,RESPONSE
+
+    END
+
+
+
+    ; --------------------------------------------------------
+    ; CMD 20 - upload PCPATH buffer
+    ; PC posle:
+    ; INTEGER PATH_COUNT
+    ; REAL PATH_SPEED
+    ; 64x REAL PATHDATA = 16 * (X,Y,Z,R)
+    ; Payload ma vzdy pevnou delku.
+    ; odpoved: 20 OK, -20 count, -21 speed
+    ; --------------------------------------------------------
+
+    IF CMD=20 THEN
+    BEGIN
+
+        READ WIN_1,PATH_COUNT
+        READ WIN_1,PATH_SPEED
+
+        PATHIDX=1
+
+        REPEAT 64 TIMES
+            READ WIN_1,PATHDATA[PATHIDX]
+            PATHIDX=PATHIDX+1
+        REPEAT_END
+
+        RESPONSE=20
+        IF PATH_COUNT<1 THEN RESPONSE=-20
+        IF PATH_COUNT>16 THEN RESPONSE=-20
+        IF PATH_SPEED<=0.0 THEN RESPONSE=-21
+
+        WRITE WIN_1,RESPONSE
+
+    END
+
+
+    ; --------------------------------------------------------
+    ; CMD 21 - START PCPATH
+    ; odpoved: 10 OK, -10 MANUAL, -11 BUSY, -12 RC ERROR
+    ;           -20 count, -21 speed
+    ; --------------------------------------------------------
+
+    IF CMD=21 THEN
+    BEGIN
+
+        RESPONSE=0
+        MOTIONBUSY=0
+
+        IF PATH_COUNT<1 THEN RESPONSE=-20
+        IF PATH_COUNT>16 THEN RESPONSE=-20
+        IF PATH_SPEED<=0.0 THEN RESPONSE=-21
+
+        IF RESPONSE=0 THEN
+        BEGIN
+            PCMOVESTATUS=CONDITION(PCMOVE)
+            LINEARSTATUS=CONDITION(PCLINEAR)
+            CIRCSTATUS=CONDITION(PCCIRC)
+            SMOOTHSTATUS=CONDITION(PCSMOOTH)
+            PATHSTATUS=CONDITION(PCPATH)
+        STREAMSTATUS=CONDITION(PCSTREAM)
+        END
+
+        IF RESPONSE=0 THEN
+        BEGIN
+            IF PCMOVESTATUS>100 THEN
+            BEGIN
+                MOVE_STATE=3
+                MOVE_ERROR=PCMOVESTATUS
+                RESPONSE=-12
+            END
+        END
+
+        IF RESPONSE=0 THEN
+        BEGIN
+            IF LINEARSTATUS>100 THEN
+            BEGIN
+                MOVE_STATE=3
+                MOVE_ERROR=LINEARSTATUS
+                RESPONSE=-12
+            END
+        END
+
+        IF RESPONSE=0 THEN
+        BEGIN
+            IF CIRCSTATUS>100 THEN
+            BEGIN
+                MOVE_STATE=3
+                MOVE_ERROR=CIRCSTATUS
+                RESPONSE=-12
+            END
+        END
+
+        IF RESPONSE=0 THEN
+        BEGIN
+            IF SMOOTHSTATUS>100 THEN
+            BEGIN
+                MOVE_STATE=3
+                MOVE_ERROR=SMOOTHSTATUS
+                RESPONSE=-12
+            END
+        END
+
+        IF RESPONSE=0 THEN
+        BEGIN
+            IF PATHSTATUS>100 THEN
+            BEGIN
+                MOVE_STATE=3
+                MOVE_ERROR=PATHSTATUS
+                RESPONSE=-12
+            END
+        END
+
+        IF RESPONSE=0 THEN
+        BEGIN
+            IF STREAMSTATUS>100 THEN
+            BEGIN
+                MOVE_STATE=3
+                MOVE_ERROR=STREAMSTATUS
+                RESPONSE=-12
+            END
+        END
+
+        IF RESPONSE=0 THEN
+        BEGIN
+            IF AUTO_RC=0 THEN RESPONSE=-10
+        END
+
+        IF RESPONSE=0 THEN
+        BEGIN
+            IF PCMOVESTATUS<>-1 THEN MOTIONBUSY=1
+            IF LINEARSTATUS<>-1 THEN MOTIONBUSY=1
+            IF CIRCSTATUS<>-1 THEN MOTIONBUSY=1
+            IF SMOOTHSTATUS<>-1 THEN MOTIONBUSY=1
+            IF PATHSTATUS<>-1 THEN MOTIONBUSY=1
+            IF STREAMSTATUS<>-1 THEN MOTIONBUSY=1
+
+            IF MOTIONBUSY=1 THEN
+            BEGIN
+                RESPONSE=-11
+            END
+
+            IF MOTIONBUSY=0 THEN
+            BEGIN
+                MOVE_ERROR=0
+                MOVE_STATE=1
+                MOVE_PROCESS=5
+                START PCPATH
+                RESPONSE=10
+            END
+        END
+
+        WRITE WIN_1,RESPONSE
+
+    END
+
+
+
+    ; --------------------------------------------------------
+    ; CMD 22 - UPLOAD STREAM SLOT A/B
+    ;
+    ; PC posle:
+    ; INTEGER slot       0=A, 1=B
+    ; INTEGER sequence
+    ; REAL    speed_mm_s
+    ; 64x REAL = 16 * (X,Y,Z,R)
+    ;
+    ; V1 intentionally uses exactly 16 points per buffer.
+    ;
+    ; response:
+    ;  22 = OK
+    ; -21 = speed <= 0
+    ; -22 = invalid slot
+    ; -23 = slot not FREE
+    ; --------------------------------------------------------
+
+    IF CMD=22 THEN
+    BEGIN
+
+        READ WIN_1,STR_SLOT
+        READ WIN_1,STR_SEQ
+
+        RESPONSE=22
+        STR_ACCEPT=0
+
+        IF STR_SLOT=0 THEN
+        BEGIN
+            IF SA_FREE=1 THEN
+            BEGIN
+                STR_ACCEPT=1
+                SA_FREE=0
+                SA_SEQ=STR_SEQ
+                READ WIN_1,SA_SPEED
+            READ WIN_1,SA_DATA[1].K1
+            READ WIN_1,SA_DATA[1].K2
+            READ WIN_1,SA_DATA[1].K3
+            READ WIN_1,SA_DATA[1].K4
+            READ WIN_1,SA_DATA[2].K1
+            READ WIN_1,SA_DATA[2].K2
+            READ WIN_1,SA_DATA[2].K3
+            READ WIN_1,SA_DATA[2].K4
+            READ WIN_1,SA_DATA[3].K1
+            READ WIN_1,SA_DATA[3].K2
+            READ WIN_1,SA_DATA[3].K3
+            READ WIN_1,SA_DATA[3].K4
+            READ WIN_1,SA_DATA[4].K1
+            READ WIN_1,SA_DATA[4].K2
+            READ WIN_1,SA_DATA[4].K3
+            READ WIN_1,SA_DATA[4].K4
+            READ WIN_1,SA_DATA[5].K1
+            READ WIN_1,SA_DATA[5].K2
+            READ WIN_1,SA_DATA[5].K3
+            READ WIN_1,SA_DATA[5].K4
+            READ WIN_1,SA_DATA[6].K1
+            READ WIN_1,SA_DATA[6].K2
+            READ WIN_1,SA_DATA[6].K3
+            READ WIN_1,SA_DATA[6].K4
+            READ WIN_1,SA_DATA[7].K1
+            READ WIN_1,SA_DATA[7].K2
+            READ WIN_1,SA_DATA[7].K3
+            READ WIN_1,SA_DATA[7].K4
+            READ WIN_1,SA_DATA[8].K1
+            READ WIN_1,SA_DATA[8].K2
+            READ WIN_1,SA_DATA[8].K3
+            READ WIN_1,SA_DATA[8].K4
+            READ WIN_1,SA_DATA[9].K1
+            READ WIN_1,SA_DATA[9].K2
+            READ WIN_1,SA_DATA[9].K3
+            READ WIN_1,SA_DATA[9].K4
+            READ WIN_1,SA_DATA[10].K1
+            READ WIN_1,SA_DATA[10].K2
+            READ WIN_1,SA_DATA[10].K3
+            READ WIN_1,SA_DATA[10].K4
+            READ WIN_1,SA_DATA[11].K1
+            READ WIN_1,SA_DATA[11].K2
+            READ WIN_1,SA_DATA[11].K3
+            READ WIN_1,SA_DATA[11].K4
+            READ WIN_1,SA_DATA[12].K1
+            READ WIN_1,SA_DATA[12].K2
+            READ WIN_1,SA_DATA[12].K3
+            READ WIN_1,SA_DATA[12].K4
+            READ WIN_1,SA_DATA[13].K1
+            READ WIN_1,SA_DATA[13].K2
+            READ WIN_1,SA_DATA[13].K3
+            READ WIN_1,SA_DATA[13].K4
+            READ WIN_1,SA_DATA[14].K1
+            READ WIN_1,SA_DATA[14].K2
+            READ WIN_1,SA_DATA[14].K3
+            READ WIN_1,SA_DATA[14].K4
+            READ WIN_1,SA_DATA[15].K1
+            READ WIN_1,SA_DATA[15].K2
+            READ WIN_1,SA_DATA[15].K3
+            READ WIN_1,SA_DATA[15].K4
+            READ WIN_1,SA_DATA[16].K1
+            READ WIN_1,SA_DATA[16].K2
+            READ WIN_1,SA_DATA[16].K3
+            READ WIN_1,SA_DATA[16].K4
+                IF SA_SPEED<=0.0 THEN
+                BEGIN
+                    RESPONSE=-21
+                    SA_FREE=1
+                END
+            END
+        END
+
+        IF STR_SLOT=1 THEN
+        BEGIN
+            IF SB_FREE=1 THEN
+            BEGIN
+                STR_ACCEPT=1
+                SB_FREE=0
+                SB_SEQ=STR_SEQ
+                READ WIN_1,SB_SPEED
+            READ WIN_1,SB_DATA[1].K1
+            READ WIN_1,SB_DATA[1].K2
+            READ WIN_1,SB_DATA[1].K3
+            READ WIN_1,SB_DATA[1].K4
+            READ WIN_1,SB_DATA[2].K1
+            READ WIN_1,SB_DATA[2].K2
+            READ WIN_1,SB_DATA[2].K3
+            READ WIN_1,SB_DATA[2].K4
+            READ WIN_1,SB_DATA[3].K1
+            READ WIN_1,SB_DATA[3].K2
+            READ WIN_1,SB_DATA[3].K3
+            READ WIN_1,SB_DATA[3].K4
+            READ WIN_1,SB_DATA[4].K1
+            READ WIN_1,SB_DATA[4].K2
+            READ WIN_1,SB_DATA[4].K3
+            READ WIN_1,SB_DATA[4].K4
+            READ WIN_1,SB_DATA[5].K1
+            READ WIN_1,SB_DATA[5].K2
+            READ WIN_1,SB_DATA[5].K3
+            READ WIN_1,SB_DATA[5].K4
+            READ WIN_1,SB_DATA[6].K1
+            READ WIN_1,SB_DATA[6].K2
+            READ WIN_1,SB_DATA[6].K3
+            READ WIN_1,SB_DATA[6].K4
+            READ WIN_1,SB_DATA[7].K1
+            READ WIN_1,SB_DATA[7].K2
+            READ WIN_1,SB_DATA[7].K3
+            READ WIN_1,SB_DATA[7].K4
+            READ WIN_1,SB_DATA[8].K1
+            READ WIN_1,SB_DATA[8].K2
+            READ WIN_1,SB_DATA[8].K3
+            READ WIN_1,SB_DATA[8].K4
+            READ WIN_1,SB_DATA[9].K1
+            READ WIN_1,SB_DATA[9].K2
+            READ WIN_1,SB_DATA[9].K3
+            READ WIN_1,SB_DATA[9].K4
+            READ WIN_1,SB_DATA[10].K1
+            READ WIN_1,SB_DATA[10].K2
+            READ WIN_1,SB_DATA[10].K3
+            READ WIN_1,SB_DATA[10].K4
+            READ WIN_1,SB_DATA[11].K1
+            READ WIN_1,SB_DATA[11].K2
+            READ WIN_1,SB_DATA[11].K3
+            READ WIN_1,SB_DATA[11].K4
+            READ WIN_1,SB_DATA[12].K1
+            READ WIN_1,SB_DATA[12].K2
+            READ WIN_1,SB_DATA[12].K3
+            READ WIN_1,SB_DATA[12].K4
+            READ WIN_1,SB_DATA[13].K1
+            READ WIN_1,SB_DATA[13].K2
+            READ WIN_1,SB_DATA[13].K3
+            READ WIN_1,SB_DATA[13].K4
+            READ WIN_1,SB_DATA[14].K1
+            READ WIN_1,SB_DATA[14].K2
+            READ WIN_1,SB_DATA[14].K3
+            READ WIN_1,SB_DATA[14].K4
+            READ WIN_1,SB_DATA[15].K1
+            READ WIN_1,SB_DATA[15].K2
+            READ WIN_1,SB_DATA[15].K3
+            READ WIN_1,SB_DATA[15].K4
+            READ WIN_1,SB_DATA[16].K1
+            READ WIN_1,SB_DATA[16].K2
+            READ WIN_1,SB_DATA[16].K3
+            READ WIN_1,SB_DATA[16].K4
+                IF SB_SPEED<=0.0 THEN
+                BEGIN
+                    RESPONSE=-21
+                    SB_FREE=1
+                END
+            END
+        END
+
+        ; If the slot was invalid/busy, consume the full remaining
+        ; payload so the TCP protocol stays aligned.
+        IF STR_ACCEPT=0 THEN
+        BEGIN
+            READ WIN_1,STR_DUMMY
+
+            REPEAT 64 TIMES
+                READ WIN_1,STR_DUMMY
+            REPEAT_END
+
+            RESPONSE=-22
+            IF STR_SLOT=0 THEN RESPONSE=-23
+            IF STR_SLOT=1 THEN RESPONSE=-23
+        END
+
+        WRITE WIN_1,RESPONSE
+
+    END
+
+
+    ; --------------------------------------------------------
+    ; CMD 23 - START PCSTREAM
+    ;
+    ; PC posle:
+    ; INTEGER STR_BLOCKS (1..8)
+    ;
+    ; Before START:
+    ;   seq0 must be in A.
+    ;   if STR_BLOCKS>=2, seq1 must be in B.
+    ;
+    ; response:
+    ;  10 = START accepted
+    ; -10 = MANUAL
+    ; -11 = another motion process active
+    ; -12 = RC error
+    ; -20 = STR_BLOCKS outside 1..8
+    ; -24 = initial A/B buffers not ready
+    ; --------------------------------------------------------
+
+    IF CMD=23 THEN
+    BEGIN
+
+        READ WIN_1,STR_BLOCKS
+
+        RESPONSE=0
+        MOTIONBUSY=0
+
+        IF STR_BLOCKS<1 THEN RESPONSE=-20
+        IF STR_BLOCKS>8 THEN RESPONSE=-20
+
+        IF RESPONSE=0 THEN
+        BEGIN
+            IF SA_FREE<>0 THEN RESPONSE=-24
+            IF SA_SEQ<>0 THEN RESPONSE=-24
+        END
+
+        IF RESPONSE=0 THEN
+        BEGIN
+            IF STR_BLOCKS>=2 THEN
+            BEGIN
+                IF SB_FREE<>0 THEN RESPONSE=-24
+                IF SB_SEQ<>1 THEN RESPONSE=-24
+            END
+        END
+
+        IF RESPONSE=0 THEN
+        BEGIN
+            PCMOVESTATUS=CONDITION(PCMOVE)
+            LINEARSTATUS=CONDITION(PCLINEAR)
+            CIRCSTATUS=CONDITION(PCCIRC)
+            SMOOTHSTATUS=CONDITION(PCSMOOTH)
+            PATHSTATUS=CONDITION(PCPATH)
+            STREAMSTATUS=CONDITION(PCSTREAM)
+        END
+
+        IF RESPONSE=0 THEN
+        BEGIN
+            IF PCMOVESTATUS>100 THEN
+            BEGIN
+                MOVE_STATE=3
+                MOVE_ERROR=PCMOVESTATUS
+                RESPONSE=-12
+            END
+        END
+
+        IF RESPONSE=0 THEN
+        BEGIN
+            IF LINEARSTATUS>100 THEN
+            BEGIN
+                MOVE_STATE=3
+                MOVE_ERROR=LINEARSTATUS
+                RESPONSE=-12
+            END
+        END
+
+        IF RESPONSE=0 THEN
+        BEGIN
+            IF CIRCSTATUS>100 THEN
+            BEGIN
+                MOVE_STATE=3
+                MOVE_ERROR=CIRCSTATUS
+                RESPONSE=-12
+            END
+        END
+
+        IF RESPONSE=0 THEN
+        BEGIN
+            IF SMOOTHSTATUS>100 THEN
+            BEGIN
+                MOVE_STATE=3
+                MOVE_ERROR=SMOOTHSTATUS
+                RESPONSE=-12
+            END
+        END
+
+        IF RESPONSE=0 THEN
+        BEGIN
+            IF PATHSTATUS>100 THEN
+            BEGIN
+                MOVE_STATE=3
+                MOVE_ERROR=PATHSTATUS
+                RESPONSE=-12
+            END
+        END
+
+        IF RESPONSE=0 THEN
+        BEGIN
+            IF STREAMSTATUS>100 THEN
+            BEGIN
+                MOVE_STATE=3
+                MOVE_ERROR=STREAMSTATUS
+                RESPONSE=-12
+            END
+        END
+
+        IF RESPONSE=0 THEN
+        BEGIN
+            IF AUTO_RC=0 THEN RESPONSE=-10
+        END
+
+        IF RESPONSE=0 THEN
+        BEGIN
+            IF PCMOVESTATUS<>-1 THEN MOTIONBUSY=1
+            IF LINEARSTATUS<>-1 THEN MOTIONBUSY=1
+            IF CIRCSTATUS<>-1 THEN MOTIONBUSY=1
+            IF SMOOTHSTATUS<>-1 THEN MOTIONBUSY=1
+            IF PATHSTATUS<>-1 THEN MOTIONBUSY=1
+            IF STREAMSTATUS<>-1 THEN MOTIONBUSY=1
+
+            IF MOTIONBUSY=1 THEN
+            BEGIN
+                RESPONSE=-11
+            END
+
+            IF MOTIONBUSY=0 THEN
+            BEGIN
+                MOVE_ERROR=0
+                MOVE_STATE=1
+                MOVE_PROCESS=6
+                START PCSTREAM
+                RESPONSE=10
+            END
+        END
+
+        WRITE WIN_1,RESPONSE
+
+    END
+
+
+    ; --------------------------------------------------------
+    ; CMD 24 - STREAM STATUS
+    ;
+    ; response: 6x INTEGER
+    ; A_FREE, B_FREE, A_SEQ, B_SEQ, STR_BLOCKS, PROCSTATUS
+    ; --------------------------------------------------------
+
+    IF CMD=24 THEN
+    BEGIN
+
+        PROCSTATUS=CONDITION(PCSTREAM)
+
+        WRITE WIN_1,SA_FREE
+        WRITE WIN_1,SB_FREE
+        WRITE WIN_1,SA_SEQ
+        WRITE WIN_1,SB_SEQ
+        WRITE WIN_1,STR_BLOCKS
+        WRITE WIN_1,PROCSTATUS
+
+    END
+
+
+
+
+    ; --------------------------------------------------------
+    ; CMD 25 - CLEAR / RESET STREAM BUFFERS
+    ;
+    ; Pouziti:
+    ; - po prerusenem uploadu pred START
+    ; - po STOP, az PCSTREAM uz neni aktivni
+    ; - pred novym stream testem
+    ;
+    ; response:
+    ;  25 = stream slots reset
+    ; -11 = PCSTREAM je stale aktivni
+    ; --------------------------------------------------------
+
+    IF CMD=25 THEN
+    BEGIN
+
+        STREAMSTATUS=CONDITION(PCSTREAM)
+        RESPONSE=25
+
+        IF STREAMSTATUS<>-1 THEN
+        BEGIN
+            RESPONSE=-11
+        END
+
+        IF RESPONSE=25 THEN
+        BEGIN
+            SA_FREE=1
+            SB_FREE=1
+            SA_SEQ=-1
+            SB_SEQ=-1
+            STR_BLOCKS=0
         END
 
         WRITE WIN_1,RESPONSE
@@ -770,6 +1504,16 @@ BEGIN
         IF MOVE_PROCESS=4 THEN
         BEGIN
             PROCSTATUS=CONDITION(PCSMOOTH)
+        END
+
+        IF MOVE_PROCESS=5 THEN
+        BEGIN
+            PROCSTATUS=CONDITION(PCPATH)
+        END
+
+        IF MOVE_PROCESS=6 THEN
+        BEGIN
+            PROCSTATUS=CONDITION(PCSTREAM)
         END
 
         ; jeste jednou zkontrolujeme RC error,

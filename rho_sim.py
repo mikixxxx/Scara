@@ -49,32 +49,44 @@ path_buffer = []              # uploaded absolute XYZR points, max 16
 path_active_segment = -1      # 0-based segment while PCPATH is running
 
 # ============================================================
-# STREAM V1 - simulator prototype of double buffering
+# STREAM BAPS V1 - wire-compatible with compiled PERMPROG.QLL
 #
-# CMD22 = upload slot A/B
-# CMD23 = start stream
-# CMD24 = stream status
+# CMD22 payload AFTER command:
+#   int32 slot        0=A, 1=B
+#   int32 sequence
+#   float32 speed_mm_s
+#   64 x float32      exactly 16 * (X,Y,Z,R)
 #
-# IMPORTANT:
-# This proves the PC-side ping-pong logic and visualization.
-# It is NOT yet proof that the real RHO4 can switch dynamic
-# buffers without a speed dip. That BAPS hand-off is the next
-# controller-side problem.
+# CMD23 payload AFTER command:
+#   int32 STR_BLOCKS  1..8
+#
+# CMD24 reply:
+#   6 x int32
+#   A_FREE, B_FREE, A_SEQ, B_SEQ, STR_BLOCKS, PROCSTATUS
+#
+# Current real BAPS prototype has FIXED 16-point buffers.
 # ============================================================
 STREAM_UPLOAD_OK = 22
 STREAM_SLOT_ERROR = -22
 STREAM_SLOT_BUSY = -23
 STREAM_NOT_READY = -24
-STREAM_SEQUENCE_ERROR = -25
 STREAM_UNDERRUN_ERROR = 29001
 
-stream_slots = [None, None]
+# The actual BAPS data arrays persist when FREE becomes 1.
+stream_slots = [
+    {"free": 1, "seq": -1, "speed": 5.0, "points": None},
+    {"free": 1, "seq": -1, "speed": 5.0, "points": None},
+]
+
+stream_blocks = 0
 stream_running = False
+
+# Simulator-only observability; these are NOT part of CMD24.
 stream_active_slot = -1
 stream_active_seq = -1
 stream_completed_seq = -1
-stream_underruns = 0
 stream_active_segment = -1
+stream_underruns = 0
 
 automatic = True
 alarm = False
@@ -797,82 +809,53 @@ def start_path_motion():
 
 
 
-def _stream_slot_mask_unlocked():
-    occupied = 0
-    free = 0
-
-    for slot_id, slot in enumerate(stream_slots):
-        if slot is None:
-            free |= (1 << slot_id)
-        else:
-            occupied |= (1 << slot_id)
-
-    return occupied, free
-
-
-def upload_stream_slot(slot_id, sequence, points, speed_mm_s, final):
+def upload_stream_slot(slot_id, sequence, points, speed_mm_s):
     """
-    Simulator-only CMD22.
+    Simulator equivalent of compiled PERMPROG CMD22.
 
-    A slot can be filled only while it is free. The active slot is never
-    overwritten. Sequence numbers make stale/reordered uploads visible.
+    Exactly 16 XYZR points are required because PCBUFA/B and PCENDA/B
+    contain exactly 16 MOVE instructions.
     """
     global stream_slots
 
     if slot_id not in (0, 1):
         return STREAM_SLOT_ERROR
 
-    if not 1 <= len(points) <= 16:
+    if len(points) != 16:
         return -20
 
     if speed_mm_s <= 0.0:
         return -21
 
-    if sequence < 0:
-        return STREAM_SEQUENCE_ERROR
-
-    # Endpoint check at upload time. Full segment check is repeated by
-    # the motion worker using the actual predecessor position.
     for index, point in enumerate(points, start=1):
         if not xy_reachable(point[0], point[1]):
             print(
-                f"[STREAM] slot {slot_id} seq={sequence}: "
+                f"[STREAM] {'AB'[slot_id]} seq={sequence}: "
                 f"P{index} unreachable "
                 f"X={point[0]:.3f} Y={point[1]:.3f}"
             )
             return START_RC_ERROR
 
     with lock:
-        if stream_slots[slot_id] is not None:
+        slot = stream_slots[slot_id]
+
+        if slot["free"] != 1:
             return STREAM_SLOT_BUSY
 
-        stream_slots[slot_id] = {
-            "seq": int(sequence),
-            "points": [list(p) for p in points],
-            "speed": float(speed_mm_s),
-            "final": bool(final),
-        }
+        # Same order as BAPS: reserve slot first, then write seq/data.
+        slot["free"] = 0
+        slot["seq"] = int(sequence)
+        slot["speed"] = float(speed_mm_s)
+        slot["points"] = [list(p) for p in points]
 
     print(
-        f"[STREAM] upload slot={'AB'[slot_id]} "
-        f"seq={sequence} points={len(points)} "
-        f"V={speed_mm_s:.3f} final={int(bool(final))}"
+        f"[STREAM] CMD22 {'AB'[slot_id]} "
+        f"seq={sequence} 16 points V={speed_mm_s:.3f} -> 22"
     )
     return STREAM_UPLOAD_OK
 
 
-def _find_stream_slot_for_sequence_unlocked(sequence):
-    for slot_id, slot in enumerate(stream_slots):
-        if slot is not None and slot["seq"] == sequence:
-            return slot_id
-    return -1
-
-
 def _stream_remaining_distance(nodes, segment_index, segment_progress):
-    """
-    Remaining simulator metric from current location to the final point
-    of the current buffer.
-    """
     if segment_index >= len(nodes) - 1:
         return 0.0
 
@@ -883,34 +866,43 @@ def _stream_remaining_distance(nodes, segment_index, segment_progress):
     remaining = max(0.0, current_length - segment_progress)
 
     for i in range(segment_index + 1, len(nodes) - 1):
-        remaining += _path_segment_metric(nodes[i], nodes[i + 1])
+        remaining += _path_segment_metric(
+            nodes[i], nodes[i + 1]
+        )
 
     return remaining
 
 
 def stream_motion_worker():
     """
-    Simulated two-slot ping-pong stream.
+    Execute the same static A/B order as PCSTREAM.QLL:
 
-    The velocity is preserved across a buffer boundary if the next sequence
-    is already ready in the other slot. If it is not ready, the simulator
-    raises STREAM_UNDERRUN_ERROR instead of pretending that seamless motion
-    is possible.
+      seq0=A, seq1=B, seq2=A, ...
+
+    Intermediate buffers keep velocity; only the final buffer decelerates.
+
+    The simulator is intentionally stricter than current BAPS:
+    it checks the expected sequence at every A/B reuse. If Python failed
+    to refill in time, it raises 29001 instead of silently reusing stale data.
     """
     global position, target, in_position
     global stream_running, stream_active_slot, stream_active_seq
-    global stream_completed_seq, stream_underruns, stream_active_segment
-    global stream_slots
+    global stream_completed_seq, stream_active_segment, stream_underruns
 
-    sequence = 0
     velocity = 0.0
-    acceleration = 120.0  # simulator-only, mm/s^2 equivalent
+    acceleration = 120.0  # simulator-only timing model
 
-    while True:
+    for sequence in range(stream_blocks):
+        slot_id = sequence & 1
+
         with lock:
-            slot_id = _find_stream_slot_for_sequence_unlocked(sequence)
+            slot = stream_slots[slot_id]
 
-            if slot_id < 0:
+            if (
+                slot["free"] != 0
+                or slot["points"] is None
+                or slot["seq"] != sequence
+            ):
                 stream_underruns += 1
                 stream_running = False
                 stream_active_slot = -1
@@ -923,26 +915,28 @@ def stream_motion_worker():
                     STREAM_UNDERRUN_ERROR
                 )
                 print(
-                    f"[STREAM] UNDERRUN: sequence {sequence} not ready"
+                    f"[STREAM] UNDERRUN expected "
+                    f"{'AB'[slot_id]} seq={sequence}, "
+                    f"got free={slot['free']} seq={slot['seq']}"
                 )
                 return
 
-            slot = stream_slots[slot_id]
             points = [p.copy() for p in slot["points"]]
             speed = float(slot["speed"])
-            final = bool(slot["final"])
+            start = position.copy()
 
             stream_active_slot = slot_id
             stream_active_seq = sequence
             stream_active_segment = 0
             target = points[-1].copy()
-            start = position.copy()
 
+        # Validate the whole 16-point buffer from the exact current position.
         try:
-            # Validate using the exact current endpoint from the previous block.
             previous = start
             for point in points:
-                validate_linear_xy_segment(previous, point, step_mm=2.0)
+                validate_linear_xy_segment(
+                    previous, point, step_mm=2.0
+                )
                 previous = point
         except ValueError as exc:
             with lock:
@@ -960,9 +954,10 @@ def stream_motion_worker():
             return
 
         nodes = [start] + points
-        desired_cruise = max(0.1, speed)
+        cruise = max(0.1, speed)
+        final_buffer = (sequence == stream_blocks - 1)
 
-        for seg_index in range(len(nodes) - 1):
+        for seg_index in range(16):
             a = nodes[seg_index]
             b = nodes[seg_index + 1]
             seg_length = _path_segment_metric(a, b)
@@ -979,7 +974,10 @@ def stream_motion_worker():
 
             while progress < seg_length:
                 now = time.monotonic()
-                dt = max(0.001, min(0.05, now - previous_time))
+                dt = max(
+                    0.001,
+                    min(0.05, now - previous_time)
+                )
                 previous_time = now
 
                 with lock:
@@ -989,27 +987,28 @@ def stream_motion_worker():
                         stream_active_seq = -1
                         stream_active_segment = -1
                         in_position = False
-                        set_move_state(MOVE_STOPPED, 0, -1)
+                        set_move_state(
+                            MOVE_STOPPED, 0, -1
+                        )
                         print("[STREAM] STOPPED")
                         return
 
-                # Only the final controller buffer is allowed to decelerate
-                # to zero. Intermediate buffers keep their velocity.
-                if final:
+                if final_buffer:
                     remaining = _stream_remaining_distance(
-                        nodes,
-                        seg_index,
-                        progress
+                        nodes, seg_index, progress
                     )
                     braking_velocity = math.sqrt(
-                        max(0.0, 2.0 * acceleration * remaining)
+                        max(
+                            0.0,
+                            2.0 * acceleration * remaining
+                        )
                     )
                     desired_velocity = min(
-                        desired_cruise,
-                        braking_velocity
+                        cruise, braking_velocity
                     )
                 else:
-                    desired_velocity = desired_cruise
+                    # Equivalent intent of VIA at inter-buffer boundary.
+                    desired_velocity = cruise
 
                 if velocity < desired_velocity:
                     velocity = min(
@@ -1024,8 +1023,7 @@ def stream_motion_worker():
 
                 if velocity < 1e-6:
                     velocity = min(
-                        desired_cruise,
-                        acceleration * dt
+                        cruise, acceleration * dt
                     )
 
                 progress = min(
@@ -1044,93 +1042,85 @@ def stream_motion_worker():
 
                 time.sleep(0.005)
 
-        # The current buffer has been consumed. Free its slot BEFORE the
-        # next buffer runs, so the PC can refill it while the other slot
-        # is active.
         with lock:
             position = points[-1].copy()
             _record_trace_unlocked(position)
 
-            stream_slots[slot_id] = None
+            # Mirrors SA_FREE=1 / SB_FREE=1 after PCBUFA/B returns.
+            stream_slots[slot_id]["free"] = 1
             stream_completed_seq = sequence
 
-            if final:
-                stream_running = False
-                stream_active_slot = -1
-                stream_active_seq = -1
-                stream_active_segment = -1
-                in_position = True
-                set_move_state(MOVE_DONE, 0, -1)
-                print(
-                    f"[STREAM] DONE seq={sequence} "
-                    f"underruns={stream_underruns}"
-                )
-                return
-
-            # The next slot must ALREADY be ready at the transition.
-            next_sequence = sequence + 1
-            next_slot = _find_stream_slot_for_sequence_unlocked(
-                next_sequence
-            )
-
-            if next_slot < 0:
-                stream_underruns += 1
-                stream_running = False
-                stream_active_slot = -1
-                stream_active_seq = -1
-                stream_active_segment = -1
-                in_position = False
-                set_move_state(
-                    MOVE_ERROR,
-                    STREAM_UNDERRUN_ERROR,
-                    STREAM_UNDERRUN_ERROR
-                )
-                print(
-                    f"[STREAM] UNDERRUN at boundary "
-                    f"{sequence}->{next_sequence}"
-                )
-                return
-
-        sequence += 1
-
-
-def start_stream_motion():
-    global stop_requested, in_position
-    global stream_running, stream_active_slot, stream_active_seq
-    global stream_completed_seq, stream_underruns, stream_active_segment
+        # Deliberately yield so the TCP/PERMPROG side can observe FREE and refill.
+        # This models process scheduling, not robot kinematics.
+        time.sleep(0.001)
 
     with lock:
+        stream_running = False
+        stream_active_slot = -1
+        stream_active_seq = -1
+        stream_active_segment = -1
+        in_position = True
+        set_move_state(MOVE_DONE, 0, -1)
+
+    print(
+        f"[STREAM] DONE blocks={stream_blocks} "
+        f"underruns={stream_underruns}"
+    )
+
+
+def start_stream_motion(block_count):
+    """Simulator equivalent of compiled PERMPROG CMD23."""
+    global stop_requested, in_position
+    global stream_running, stream_blocks
+    global stream_active_slot, stream_active_seq
+    global stream_completed_seq, stream_active_segment
+    global stream_underruns
+
+    block_count = int(block_count)
+
+    with lock:
+        if block_count < 1 or block_count > 8:
+            return -20
+
         if not automatic:
             return START_MANUAL
+
         if move_state == MOVE_RUNNING or stream_running:
             return START_BUSY
+
         if move_state == MOVE_ERROR:
             return START_RC_ERROR
+
         if alarm:
-            set_move_state(MOVE_ERROR, 144384, 144384)
+            set_move_state(
+                MOVE_ERROR, 144384, 144384
+            )
             return START_RC_ERROR
 
-        first_slot_id = _find_stream_slot_for_sequence_unlocked(0)
-        if first_slot_id < 0:
+        # Exact initial readiness checks from compiled PERMPROG.
+        if (
+            stream_slots[0]["free"] != 0
+            or stream_slots[0]["seq"] != 0
+        ):
             return STREAM_NOT_READY
 
-        first = stream_slots[first_slot_id]
-
-        # If sequence 0 is not final, preload sequence 1 as well.
-        # This guarantees that the very first transition is protected.
-        if not first["final"]:
-            second_slot_id = _find_stream_slot_for_sequence_unlocked(1)
-            if second_slot_id < 0:
+        if block_count >= 2:
+            if (
+                stream_slots[1]["free"] != 0
+                or stream_slots[1]["seq"] != 1
+            ):
                 return STREAM_NOT_READY
 
+        stream_blocks = block_count
         stop_requested = False
         in_position = False
         stream_running = True
         stream_active_slot = -1
         stream_active_seq = -1
         stream_completed_seq = -1
-        stream_underruns = 0
         stream_active_segment = -1
+        stream_underruns = 0
+
         set_move_state(MOVE_RUNNING, 0, 1)
         _record_trace_unlocked(position)
 
@@ -1139,23 +1129,46 @@ def start_stream_motion():
         daemon=True
     ).start()
 
-    print("[STREAM] START")
+    print(f"[STREAM] CMD23 START blocks={block_count} -> 10")
     return START_OK
 
 
 def get_stream_status():
+    """
+    Exact CMD24 reply shape of compiled PERMPROG:
+      A_FREE, B_FREE, A_SEQ, B_SEQ, STR_BLOCKS, PROCSTATUS
+    """
     with lock:
-        occupied_mask, free_mask = _stream_slot_mask_unlocked()
         return (
-            int(stream_running),
-            int(stream_active_slot),
-            int(stream_active_seq),
-            int(stream_completed_seq),
-            int(occupied_mask),
-            int(free_mask),
-            int(stream_underruns),
-            int(stream_active_segment),
+            int(stream_slots[0]["free"]),
+            int(stream_slots[1]["free"]),
+            int(stream_slots[0]["seq"]),
+            int(stream_slots[1]["seq"]),
+            int(stream_blocks),
+            int(procstatus),
         )
+
+
+
+def clear_stream_state():
+    """Simulator equivalent of PERMPROG CMD25."""
+    global stream_blocks
+
+    with lock:
+        if stream_running:
+            return START_BUSY
+
+        for slot in stream_slots:
+            slot["free"] = 1
+            slot["seq"] = -1
+            slot["speed"] = 5.0
+            slot["points"] = None
+
+        stream_blocks = 0
+
+    print("[STREAM] CMD25 CLEAR -> 25")
+    return 25
+
 
 
 def handle_client(conn, addr):
@@ -1328,57 +1341,74 @@ def handle_client(conn, addr):
                 print(f"[PCPATH] CMD21 start -> {response}")
                 conn.sendall(struct.pack("<i", response))
 
-            # CMD 22 - STREAM SLOT UPLOAD (simulator prototype)
+            # CMD 22 - exact compiled BAPS protocol
             #
-            # Payload after command:
-            #   int32 slot       0=A, 1=B
+            # after command:
+            #   int32 slot
             #   int32 sequence
-            #   int32 count
-            #   int32 final
             #   float32 speed_mm_s
-            #   64 x float32 = 16*(X,Y,Z,R)
+            #   64 x float32 = exactly 16 XYZR points
             elif cmd == 22:
-                data = recv_exact(conn, 276)
+                data = recv_exact(conn, 268)
 
-                slot_id, sequence, count, final = struct.unpack(
-                    "<iiii",
-                    data[0:16]
+                slot_id, sequence = struct.unpack(
+                    "<ii", data[0:8]
                 )
-                speed_mm_s = struct.unpack("<f", data[16:20])[0]
-                values = struct.unpack("<64f", data[20:276])
+                speed_mm_s = struct.unpack(
+                    "<f", data[8:12]
+                )[0]
+                values = struct.unpack(
+                    "<64f", data[12:268]
+                )
 
                 points = []
-                if 1 <= count <= 16:
-                    for i in range(count):
-                        base = i * 4
-                        points.append(
-                            list(values[base:base + 4])
-                        )
+                for i in range(16):
+                    base = i * 4
+                    points.append(
+                        list(values[base:base + 4])
+                    )
 
                 response = upload_stream_slot(
                     slot_id,
                     sequence,
                     points,
-                    speed_mm_s,
-                    bool(final)
+                    speed_mm_s
                 )
 
-                conn.sendall(struct.pack("<i", response))
+                conn.sendall(
+                    struct.pack("<i", response)
+                )
 
-            # CMD 23 - START STREAM
+            # CMD 23 - exact compiled BAPS protocol
+            # after command: int32 STR_BLOCKS
             elif cmd == 23:
-                response = start_stream_motion()
-                conn.sendall(struct.pack("<i", response))
+                block_count = struct.unpack(
+                    "<i", recv_exact(conn, 4)
+                )[0]
 
-            # CMD 24 - STREAM STATUS
-            #
-            # 8 x int32:
-            # running, active_slot, active_seq, completed_seq,
-            # occupied_mask, free_mask, underruns, active_segment
+                response = start_stream_motion(
+                    block_count
+                )
+
+                conn.sendall(
+                    struct.pack("<i", response)
+                )
+
+            # CMD 24 - exact compiled BAPS reply
+            # 6 x int32:
+            # A_FREE, B_FREE, A_SEQ, B_SEQ,
+            # STR_BLOCKS, PROCSTATUS
             elif cmd == 24:
                 conn.sendall(
-                    struct.pack("<8i", *get_stream_status())
+                    struct.pack(
+                        "<6i", *get_stream_status()
+                    )
                 )
+
+            # CMD25 - clear/reset stream slots, no motion
+            elif cmd == 25:
+                response = clear_stream_state()
+                conn.sendall(struct.pack("<i", response))
 
             else:
                 print(f"[WARN] Unknown command: {cmd}")
@@ -1483,38 +1513,24 @@ Simulator console:
 
                 elif cmd == "stream":
                     (
-                        running,
-                        active_slot,
-                        active_seq,
-                        completed_seq,
-                        occupied_mask,
-                        free_mask,
-                        underruns,
-                        active_segment,
+                        a_free,
+                        b_free,
+                        a_seq,
+                        b_seq,
+                        blocks,
+                        stream_proc,
                     ) = get_stream_status()
 
                     print(
-                        f"STREAM running={running} "
-                        f"active_slot={active_slot} "
-                        f"active_seq={active_seq} "
-                        f"completed_seq={completed_seq} "
-                        f"occupied=0b{occupied_mask:02b} "
-                        f"free=0b{free_mask:02b} "
-                        f"underruns={underruns} "
-                        f"segment={active_segment}"
+                        f"STREAM running={int(stream_running)} "
+                        f"active_slot={stream_active_slot} "
+                        f"active_seq={stream_active_seq} "
+                        f"completed_seq={stream_completed_seq} "
+                        f"A_FREE={a_free} B_FREE={b_free} "
+                        f"A_SEQ={a_seq} B_SEQ={b_seq} "
+                        f"blocks={blocks} proc={stream_proc} "
+                        f"underruns={stream_underruns}"
                     )
-
-                    for slot_id, slot in enumerate(stream_slots):
-                        if slot is None:
-                            print(f"  {'AB'[slot_id]}: FREE")
-                        else:
-                            print(
-                                f"  {'AB'[slot_id]}: "
-                                f"seq={slot['seq']} "
-                                f"points={len(slot['points'])} "
-                                f"V={slot['speed']:.3f} "
-                                f"final={int(slot['final'])}"
-                            )
 
                 elif cmd == "cleartrace":
                     trajectory.clear()
@@ -1659,25 +1675,30 @@ class SimulatorView:
             uploaded_path = [p.copy() for p in path_buffer]
             active_segment = path_active_segment
             (
-                stream_is_running,
-                stream_slot,
-                stream_seq,
-                stream_done_seq,
-                stream_occupied_mask,
-                stream_free_mask,
-                stream_underrun_count,
-                stream_segment,
+                stream_a_free,
+                stream_b_free,
+                stream_a_seq,
+                stream_b_seq,
+                stream_block_count,
+                stream_proc,
             ) = get_stream_status()
+
+            stream_is_running = stream_running
+            stream_slot = stream_active_slot
+            stream_seq = stream_active_seq
+            stream_done_seq = stream_completed_seq
+            stream_underrun_count = stream_underruns
+            stream_segment = stream_active_segment
 
             stream_slot_points = []
             for slot_id, slot in enumerate(stream_slots):
-                if slot is not None:
+                if slot["points"] is not None:
                     stream_slot_points.append(
                         (
                             slot_id,
                             slot["seq"],
                             [q.copy() for q in slot["points"]],
-                            bool(slot["final"]),
+                            False,
                         )
                     )
 
@@ -1791,10 +1812,11 @@ class SimulatorView:
                 f"STREAM={'RUN' if stream_is_running else 'IDLE'}  "
                 f"SLOT={('AB'[stream_slot] if stream_slot in (0,1) else '-')}  "
                 f"SEQ={stream_seq} DONE={stream_done_seq}  "
-                f"FREE=0b{stream_free_mask:02b}  "
+                f"A_FREE={stream_a_free} B_FREE={stream_b_free}  "
+                f"A_SEQ={stream_a_seq} B_SEQ={stream_b_seq}  "
                 f"UNDERRUN={stream_underrun_count}\n"
                 f"A1 limit check: {'ON' if CHECK_A1_LIMIT else 'OFF'}  "
-                f"CMD17/18: ON  CMD20/21: ON  CMD22/23/24: ON"
+                f"CMD17/18: ON  CMD20/21: ON  CMD22/23/24/25: ON"
             )
         )
 
