@@ -98,3 +98,25 @@ This makes an aborted/preloaded stream recoverable without restarting PERMPROG.
 
 IMPORTANT: PERMPROG was changed. Compile PERMPROG first and then recompile
 all programs that import its PUBLIC COMMON data, in the same order as before.
+
+
+V4 LONG STREAM
+--------------
+PCSTREAM was statically extended from 8 to 32 buffers.
+That is 512 LINEAR endpoint blocks in one PROGR_SLOPE chain.
+
+No PUBLIC COMMON fields were added or removed, but compile in the safe order:
+1. PERMPROG.QLL
+2. PCMOVE.QLL
+3. PCLINEAR.QLL
+4. PCCIRC.QLL
+5. PCSMOOTH.QLL
+6. PCPATH.QLL
+7. PCBUFA.QLL
+8. PCBUFB.QLL
+9. PCENDA.QLL
+10. PCENDB.QLL
+11. PCSTREAM.QLL
+
+First physical long-stream proof should use 12 buffers / 192 points on the
+already tested small circle envelope. Do not jump directly to a large path.

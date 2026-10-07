@@ -1,0 +1,438 @@
+;;CONTROL = rho4
+;;INT = LINEAR
+;;KINEMATICS: (1=ROBI1)
+;;ROBI1.JC_NAMES = A1,A2,A3,A4
+;;ROBI1.WC_NAMES = K1,K2,K3,K4
+
+PROGRAM HYENDB
+
+EXTERNAL PERMPROG: HB_END
+EXTERNAL PERMPROG: HB_MID
+EXTERNAL PERMPROG: HB_V
+EXTERNAL PERMPROG: HB_TYPE
+EXTERNAL PERMPROG: HB_COUNT
+
+BEGIN
+
+PROGR_SLOPE
+
+IF HB_COUNT>=1 THEN
+BEGIN
+    IF HB_COUNT=1 THEN
+    BEGIN
+        IF HB_TYPE[1]=1 THEN
+        BEGIN
+            MOVE LINEAR WITH V=HB_V[1] TO HB_END[1]
+        END
+        ELSE
+        BEGIN
+            MOVE CIRCULAR WITH V=HB_V[1] TO (HB_MID[1],HB_END[1])
+        END
+    END
+    ELSE
+    BEGIN
+        IF HB_TYPE[1]=1 THEN
+        BEGIN
+            MOVE LINEAR WITH V=HB_V[1] VIA HB_END[1]
+        END
+        ELSE
+        BEGIN
+            MOVE CIRCULAR WITH V=HB_V[1] VIA (HB_MID[1],HB_END[1])
+        END
+    END
+END
+
+IF HB_COUNT>=2 THEN
+BEGIN
+    IF HB_COUNT=2 THEN
+    BEGIN
+        IF HB_TYPE[2]=1 THEN
+        BEGIN
+            MOVE LINEAR WITH V=HB_V[2] TO HB_END[2]
+        END
+        ELSE
+        BEGIN
+            MOVE CIRCULAR WITH V=HB_V[2] TO (HB_MID[2],HB_END[2])
+        END
+    END
+    ELSE
+    BEGIN
+        IF HB_TYPE[2]=1 THEN
+        BEGIN
+            MOVE LINEAR WITH V=HB_V[2] VIA HB_END[2]
+        END
+        ELSE
+        BEGIN
+            MOVE CIRCULAR WITH V=HB_V[2] VIA (HB_MID[2],HB_END[2])
+        END
+    END
+END
+
+IF HB_COUNT>=3 THEN
+BEGIN
+    IF HB_COUNT=3 THEN
+    BEGIN
+        IF HB_TYPE[3]=1 THEN
+        BEGIN
+            MOVE LINEAR WITH V=HB_V[3] TO HB_END[3]
+        END
+        ELSE
+        BEGIN
+            MOVE CIRCULAR WITH V=HB_V[3] TO (HB_MID[3],HB_END[3])
+        END
+    END
+    ELSE
+    BEGIN
+        IF HB_TYPE[3]=1 THEN
+        BEGIN
+            MOVE LINEAR WITH V=HB_V[3] VIA HB_END[3]
+        END
+        ELSE
+        BEGIN
+            MOVE CIRCULAR WITH V=HB_V[3] VIA (HB_MID[3],HB_END[3])
+        END
+    END
+END
+
+IF HB_COUNT>=4 THEN
+BEGIN
+    IF HB_COUNT=4 THEN
+    BEGIN
+        IF HB_TYPE[4]=1 THEN
+        BEGIN
+            MOVE LINEAR WITH V=HB_V[4] TO HB_END[4]
+        END
+        ELSE
+        BEGIN
+            MOVE CIRCULAR WITH V=HB_V[4] TO (HB_MID[4],HB_END[4])
+        END
+    END
+    ELSE
+    BEGIN
+        IF HB_TYPE[4]=1 THEN
+        BEGIN
+            MOVE LINEAR WITH V=HB_V[4] VIA HB_END[4]
+        END
+        ELSE
+        BEGIN
+            MOVE CIRCULAR WITH V=HB_V[4] VIA (HB_MID[4],HB_END[4])
+        END
+    END
+END
+
+IF HB_COUNT>=5 THEN
+BEGIN
+    IF HB_COUNT=5 THEN
+    BEGIN
+        IF HB_TYPE[5]=1 THEN
+        BEGIN
+            MOVE LINEAR WITH V=HB_V[5] TO HB_END[5]
+        END
+        ELSE
+        BEGIN
+            MOVE CIRCULAR WITH V=HB_V[5] TO (HB_MID[5],HB_END[5])
+        END
+    END
+    ELSE
+    BEGIN
+        IF HB_TYPE[5]=1 THEN
+        BEGIN
+            MOVE LINEAR WITH V=HB_V[5] VIA HB_END[5]
+        END
+        ELSE
+        BEGIN
+            MOVE CIRCULAR WITH V=HB_V[5] VIA (HB_MID[5],HB_END[5])
+        END
+    END
+END
+
+IF HB_COUNT>=6 THEN
+BEGIN
+    IF HB_COUNT=6 THEN
+    BEGIN
+        IF HB_TYPE[6]=1 THEN
+        BEGIN
+            MOVE LINEAR WITH V=HB_V[6] TO HB_END[6]
+        END
+        ELSE
+        BEGIN
+            MOVE CIRCULAR WITH V=HB_V[6] TO (HB_MID[6],HB_END[6])
+        END
+    END
+    ELSE
+    BEGIN
+        IF HB_TYPE[6]=1 THEN
+        BEGIN
+            MOVE LINEAR WITH V=HB_V[6] VIA HB_END[6]
+        END
+        ELSE
+        BEGIN
+            MOVE CIRCULAR WITH V=HB_V[6] VIA (HB_MID[6],HB_END[6])
+        END
+    END
+END
+
+IF HB_COUNT>=7 THEN
+BEGIN
+    IF HB_COUNT=7 THEN
+    BEGIN
+        IF HB_TYPE[7]=1 THEN
+        BEGIN
+            MOVE LINEAR WITH V=HB_V[7] TO HB_END[7]
+        END
+        ELSE
+        BEGIN
+            MOVE CIRCULAR WITH V=HB_V[7] TO (HB_MID[7],HB_END[7])
+        END
+    END
+    ELSE
+    BEGIN
+        IF HB_TYPE[7]=1 THEN
+        BEGIN
+            MOVE LINEAR WITH V=HB_V[7] VIA HB_END[7]
+        END
+        ELSE
+        BEGIN
+            MOVE CIRCULAR WITH V=HB_V[7] VIA (HB_MID[7],HB_END[7])
+        END
+    END
+END
+
+IF HB_COUNT>=8 THEN
+BEGIN
+    IF HB_COUNT=8 THEN
+    BEGIN
+        IF HB_TYPE[8]=1 THEN
+        BEGIN
+            MOVE LINEAR WITH V=HB_V[8] TO HB_END[8]
+        END
+        ELSE
+        BEGIN
+            MOVE CIRCULAR WITH V=HB_V[8] TO (HB_MID[8],HB_END[8])
+        END
+    END
+    ELSE
+    BEGIN
+        IF HB_TYPE[8]=1 THEN
+        BEGIN
+            MOVE LINEAR WITH V=HB_V[8] VIA HB_END[8]
+        END
+        ELSE
+        BEGIN
+            MOVE CIRCULAR WITH V=HB_V[8] VIA (HB_MID[8],HB_END[8])
+        END
+    END
+END
+
+IF HB_COUNT>=9 THEN
+BEGIN
+    IF HB_COUNT=9 THEN
+    BEGIN
+        IF HB_TYPE[9]=1 THEN
+        BEGIN
+            MOVE LINEAR WITH V=HB_V[9] TO HB_END[9]
+        END
+        ELSE
+        BEGIN
+            MOVE CIRCULAR WITH V=HB_V[9] TO (HB_MID[9],HB_END[9])
+        END
+    END
+    ELSE
+    BEGIN
+        IF HB_TYPE[9]=1 THEN
+        BEGIN
+            MOVE LINEAR WITH V=HB_V[9] VIA HB_END[9]
+        END
+        ELSE
+        BEGIN
+            MOVE CIRCULAR WITH V=HB_V[9] VIA (HB_MID[9],HB_END[9])
+        END
+    END
+END
+
+IF HB_COUNT>=10 THEN
+BEGIN
+    IF HB_COUNT=10 THEN
+    BEGIN
+        IF HB_TYPE[10]=1 THEN
+        BEGIN
+            MOVE LINEAR WITH V=HB_V[10] TO HB_END[10]
+        END
+        ELSE
+        BEGIN
+            MOVE CIRCULAR WITH V=HB_V[10] TO (HB_MID[10],HB_END[10])
+        END
+    END
+    ELSE
+    BEGIN
+        IF HB_TYPE[10]=1 THEN
+        BEGIN
+            MOVE LINEAR WITH V=HB_V[10] VIA HB_END[10]
+        END
+        ELSE
+        BEGIN
+            MOVE CIRCULAR WITH V=HB_V[10] VIA (HB_MID[10],HB_END[10])
+        END
+    END
+END
+
+IF HB_COUNT>=11 THEN
+BEGIN
+    IF HB_COUNT=11 THEN
+    BEGIN
+        IF HB_TYPE[11]=1 THEN
+        BEGIN
+            MOVE LINEAR WITH V=HB_V[11] TO HB_END[11]
+        END
+        ELSE
+        BEGIN
+            MOVE CIRCULAR WITH V=HB_V[11] TO (HB_MID[11],HB_END[11])
+        END
+    END
+    ELSE
+    BEGIN
+        IF HB_TYPE[11]=1 THEN
+        BEGIN
+            MOVE LINEAR WITH V=HB_V[11] VIA HB_END[11]
+        END
+        ELSE
+        BEGIN
+            MOVE CIRCULAR WITH V=HB_V[11] VIA (HB_MID[11],HB_END[11])
+        END
+    END
+END
+
+IF HB_COUNT>=12 THEN
+BEGIN
+    IF HB_COUNT=12 THEN
+    BEGIN
+        IF HB_TYPE[12]=1 THEN
+        BEGIN
+            MOVE LINEAR WITH V=HB_V[12] TO HB_END[12]
+        END
+        ELSE
+        BEGIN
+            MOVE CIRCULAR WITH V=HB_V[12] TO (HB_MID[12],HB_END[12])
+        END
+    END
+    ELSE
+    BEGIN
+        IF HB_TYPE[12]=1 THEN
+        BEGIN
+            MOVE LINEAR WITH V=HB_V[12] VIA HB_END[12]
+        END
+        ELSE
+        BEGIN
+            MOVE CIRCULAR WITH V=HB_V[12] VIA (HB_MID[12],HB_END[12])
+        END
+    END
+END
+
+IF HB_COUNT>=13 THEN
+BEGIN
+    IF HB_COUNT=13 THEN
+    BEGIN
+        IF HB_TYPE[13]=1 THEN
+        BEGIN
+            MOVE LINEAR WITH V=HB_V[13] TO HB_END[13]
+        END
+        ELSE
+        BEGIN
+            MOVE CIRCULAR WITH V=HB_V[13] TO (HB_MID[13],HB_END[13])
+        END
+    END
+    ELSE
+    BEGIN
+        IF HB_TYPE[13]=1 THEN
+        BEGIN
+            MOVE LINEAR WITH V=HB_V[13] VIA HB_END[13]
+        END
+        ELSE
+        BEGIN
+            MOVE CIRCULAR WITH V=HB_V[13] VIA (HB_MID[13],HB_END[13])
+        END
+    END
+END
+
+IF HB_COUNT>=14 THEN
+BEGIN
+    IF HB_COUNT=14 THEN
+    BEGIN
+        IF HB_TYPE[14]=1 THEN
+        BEGIN
+            MOVE LINEAR WITH V=HB_V[14] TO HB_END[14]
+        END
+        ELSE
+        BEGIN
+            MOVE CIRCULAR WITH V=HB_V[14] TO (HB_MID[14],HB_END[14])
+        END
+    END
+    ELSE
+    BEGIN
+        IF HB_TYPE[14]=1 THEN
+        BEGIN
+            MOVE LINEAR WITH V=HB_V[14] VIA HB_END[14]
+        END
+        ELSE
+        BEGIN
+            MOVE CIRCULAR WITH V=HB_V[14] VIA (HB_MID[14],HB_END[14])
+        END
+    END
+END
+
+IF HB_COUNT>=15 THEN
+BEGIN
+    IF HB_COUNT=15 THEN
+    BEGIN
+        IF HB_TYPE[15]=1 THEN
+        BEGIN
+            MOVE LINEAR WITH V=HB_V[15] TO HB_END[15]
+        END
+        ELSE
+        BEGIN
+            MOVE CIRCULAR WITH V=HB_V[15] TO (HB_MID[15],HB_END[15])
+        END
+    END
+    ELSE
+    BEGIN
+        IF HB_TYPE[15]=1 THEN
+        BEGIN
+            MOVE LINEAR WITH V=HB_V[15] VIA HB_END[15]
+        END
+        ELSE
+        BEGIN
+            MOVE CIRCULAR WITH V=HB_V[15] VIA (HB_MID[15],HB_END[15])
+        END
+    END
+END
+
+IF HB_COUNT>=16 THEN
+BEGIN
+    IF HB_COUNT=16 THEN
+    BEGIN
+        IF HB_TYPE[16]=1 THEN
+        BEGIN
+            MOVE LINEAR WITH V=HB_V[16] TO HB_END[16]
+        END
+        ELSE
+        BEGIN
+            MOVE CIRCULAR WITH V=HB_V[16] TO (HB_MID[16],HB_END[16])
+        END
+    END
+    ELSE
+    BEGIN
+        IF HB_TYPE[16]=1 THEN
+        BEGIN
+            MOVE LINEAR WITH V=HB_V[16] VIA HB_END[16]
+        END
+        ELSE
+        BEGIN
+            MOVE CIRCULAR WITH V=HB_V[16] VIA (HB_MID[16],HB_END[16])
+        END
+    END
+END
+
+HALT
+
+PROGRAM_END
+
