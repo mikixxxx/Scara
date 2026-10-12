@@ -577,7 +577,10 @@ class _BaseRunnerV8:
             return
 
         if self.pending_points:
-            if abs(feed_mm_min - self.pending_feed) > 1e-9:
+            pending_feed = self.pending_feed
+            if pending_feed is None:
+                raise RuntimeError("Interni chyba: pending_feed je None")
+            if abs(feed_mm_min - pending_feed) > 1e-9:
                 self._close_pending_run("zmena feedu")
         else:
             self.pending_feed = feed_mm_min
