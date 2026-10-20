@@ -6,17 +6,20 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
 from scara_kinematics import SR6Geometry, tool_to_flange, flange_to_tool
+from scara_stroke_font import strokes as stroke_text
+from scara_vectors import cubic_points, transform_paths, _clean_paths
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 7
 DEFAULT_TOOL = {"name": "Bez nastroje", "x": 0.0, "y": 0.0, "z": 0.0, "r": 0.0}
 DEFAULT_START = {"x": 450.0, "y": 0.0, "z": 100.0, "r": 0.0}
-MOVE_TYPES = ("ptp", "rapid", "linear", "arc")
-OP_TYPES = MOVE_TYPES + ("delay", "wait_input")
+MOVE_TYPES = ("ptp", "rapid", "linear", "arc", "bezier")
+OP_TYPES = MOVE_TYPES + ("rotate", "text", "vector", "spindle", "delay", "wait_input")
 SOLVER = SR6Geometry()  # Purely offline; no connection code exists.
 
 
@@ -24,7 +27,7 @@ def new_project():
     return {"schema": SCHEMA_VERSION, "name": "Novy projekt", "start": dict(DEFAULT_START),
             "move_to_start": False, "operations": [],
             "tools": [dict(DEFAULT_TOOL)], "active_tool": DEFAULT_TOOL["name"],
-            "tcp_compensate": False}
+            "tcp_compensate": False, "ignore_refill_warning": False}
 
 
 def pose(data):
@@ -112,8 +115,8 @@ def _has_tool_offset(tool):
 
 
 def normalize_project(obj):
-    if not isinstance(obj, dict) or obj.get("schema") not in (1, 2, 3, SCHEMA_VERSION):
-        raise ValueError("Nepodporovana verze formatu projektu .scara (schema 1..4).")
+    if not isinstance(obj, dict) or obj.get("schema") not in (1, 2, 3, 4, 5, 6, SCHEMA_VERSION):
+        raise ValueError("Nepodporovana verze formatu projektu .scara (schema 1..7).")
     from_v01 = (obj["schema"] == 1)
     start = obj.get("start")
     if not isinstance(start, dict):
@@ -132,6 +135,9 @@ def normalize_project(obj):
     compensation = obj.get("tcp_compensate", False)
     if not isinstance(compensation, bool):
         raise ValueError("tcp_compensate musi byt true/false.")
+    ignore_refill = obj.get("ignore_refill_warning", False)
+    if not isinstance(ignore_refill, bool):
+        raise ValueError("ignore_refill_warning musi byt true/false")
     cleaned = []
     for no, raw in enumerate(operations, 1):
         if not isinstance(raw, dict):
@@ -150,6 +156,42 @@ def normalize_project(obj):
             if kind == "arc":
                 for k in ("mx", "my"):
                     op[k] = _clean_float(raw[k], f"operace {no}.{k}")
+            if kind == "bezier":
+                for k in ("c1x","c1y","c2x","c2y","tolerance"):
+                    op[k] = _clean_float(raw[k], f"BEZIER {no}.{k}")
+                if not 0.005 <= op["tolerance"] <= 5.0:
+                    raise ValueError(f"BEZIER {no}: tolerance 0.005..5 mm")
+                cubic_points((0,0), (op['c1x'],op['c1y']), (op['c2x'],op['c2y']),
+                             (op['x'],op['y']), op['tolerance'])
+            if kind == "ptp":
+                op["ptp_speed"] = _clean_float(raw.get("ptp_speed", 2.0), f"PTP speed {no}")
+        elif kind == "rotate":
+            op["r"] = _clean_float(raw["r"], f"ROTATE R {no}")
+            op["ptp_speed"] = _clean_float(raw.get("ptp_speed", 2.0), f"ROTATE speed {no}")
+        elif kind == "text":
+            op["text"] = str(raw["text"]).upper()
+            for k in ("x", "y", "z", "r", "height", "spacing", "safe_z", "feed"):
+                op[k] = _clean_float(raw[k], f"TEXT {no}.{k}")
+            # Legacy TEXT.r is kept for .scara compatibility, but runtime
+            # tool orientation R always follows the previous operation.
+            op["angle_deg"] = _clean_float(raw.get("angle_deg", 0.0), f"TEXT {no}.angle_deg")
+            stroke_text(op["text"], op["x"], op["y"], op["height"],
+                        op["spacing"], op["angle_deg"])
+        elif kind == "vector":
+            op["source"] = str(raw.get("source", "import"))[:180]
+            for k in ("x","y","z","safe_z","angle_deg","scale","feed"):
+                op[k] = _clean_float(raw[k], f"VECTOR {no}.{k}")
+            if not 0.001 <= op["scale"] <= 1000:
+                raise ValueError(f"VECTOR {no}: meritko 0.001..1000")
+            if not 0.01 <= op["feed"] <= 100000:
+                raise ValueError(f"VECTOR {no}: F musi byt kladne")
+            op["paths"] = [[[float(a),float(b)] for a,b in poly]
+                           for poly in _clean_paths(raw["paths"])]
+            op["skipped"] = dict(raw.get("skipped", {}))
+        elif kind == "spindle":
+            if not isinstance(raw.get("enabled"), bool):
+                raise ValueError(f"Operace {no}: SPINDLE enabled musi byt true/false")
+            op["enabled"] = raw["enabled"]
         elif kind == "delay":
             op["seconds"] = _clean_float(raw["seconds"], f"operace {no}.seconds")
         elif kind == "wait_input":
@@ -165,6 +207,7 @@ def normalize_project(obj):
         "start": clean_start,
         "move_to_start": move_to_start,
         "tools": tools, "active_tool": active_name, "tcp_compensate": compensation,
+        "ignore_refill_warning": ignore_refill,
         "operations": cleaned,
     }
 
@@ -241,9 +284,85 @@ def circle_from_3_points(a, m, b):
             "mid_fraction": through/sweep}
 
 
-def endpoint(prev, op):
-    if op["type"] in MOVE_TYPES:
+def text_toolpath_targets(prev, op):
+    """Explicit sequence of (rapid|linear, TCP XYZR) with travel at safe Z."""
+    curves = stroke_text(op["text"], op["x"], op["y"], op["height"],
+                         op["spacing"], op.get("angle_deg", 0.0))
+    # TEXT does not command a rotation of the robot; it inherits the active R.
+    z, safe, r = op["z"], op["safe_z"], float(prev[3])
+    if safe < z + 0.5:
+        raise ValueError("TEXT: bezpečna vyska musi byt alespon o 0.5 mm vyssi nez gravirovaci Z")
+    if op["feed"] <= 0:
+        raise ValueError("TEXT: F musi byt kladne")
+    result = []
+    current = tuple(prev)
+    for poly in curves:
+        first = poly[0]
+        if abs(current[2] - safe) > 1e-6:
+            current = (current[0], current[1], safe, r)
+            result.append(("rapid", current))
+        travel = (first[0], first[1], safe, r)
+        if math.dist(current[:2], travel[:2]) > 1e-8:
+            result.append(("rapid", travel))
+        current = (first[0], first[1], z, r)
+        result.append(("linear", current))
+        for x, y in poly[1:]:
+            current = (x, y, z, r)
+            result.append(("linear", current))
+        current = (current[0], current[1], safe, r)
+        result.append(("rapid", current))
+    if len(result) > 3000:
+        raise ValueError("TEXT: prilis mnoho pohybu v jednom objektu")
+    return result
+
+
+
+def vector_toolpath_targets(prev, op):
+    """Imported local XY paths: safe-Z approach, strokes at Z, safe-Z exit."""
+    curves = transform_paths(op["paths"],op["x"],op["y"],op["angle_deg"],op["scale"])
+    z,safe,r = op["z"],op["safe_z"],float(prev[3])
+    if safe < z+0.5:
+        raise ValueError("IMPORT: prejezdove Z musi byt aspon o 0.5 mm vyssi")
+    result=[];current=tuple(prev)
+    for poly in curves:
+        if abs(current[2]-safe)>1e-6:
+            current=(current[0],current[1],safe,r)
+            result.append(("rapid",current))
+        first=poly[0]
+        travel=(first[0],first[1],safe,r)
+        if math.dist(current[:2], travel[:2])>1e-8:
+            result.append(("rapid",travel))
+        current=(first[0],first[1],z,r);result.append(("linear",current))
+        for x,y in poly[1:]:
+            current=(x,y,z,r);result.append(("linear",current))
+        current=(current[0],current[1],safe,r);result.append(("rapid",current))
+    if len(result)>60000:
+        raise ValueError("IMPORT: prilis mnoho G-code pohybu")
+    return result
+
+
+def bezier_toolpath_points(prev, op):
+    if abs(_joint_delta(prev[3],op['r']))>1e-6:
+        raise ValueError('BEZIER: orientace R musi zustat konstantni')
+    if abs(prev[2]-op['z'])>1e-6:
+        raise ValueError('BEZIER: Z musi zustat konstantni')
+    pts = cubic_points(prev[:2],(op['c1x'],op['c1y']),
+                       (op['c2x'],op['c2y']),(op['x'],op['y']),op['tolerance'])
+    return [(x,y,op['z'],op['r']) for x,y in pts[1:]]
+
+
+def endpoint(prev, op, tool=None):
+    kind = op["type"]
+    if kind in MOVE_TYPES:
         return pose(op)
+    if kind == "rotate":
+        t = DEFAULT_TOOL if tool is None else tool
+        flange = tool_to_flange(prev, t)
+        return flange_to_tool((*flange[:3], op["r"] - t["r"]), t)
+    if kind == "text":
+        return text_toolpath_targets(prev, op)[-1][1]
+    if kind == "vector":
+        return vector_toolpath_targets(prev, op)[-1][1]
     return prev
 
 
@@ -253,6 +372,16 @@ def path_samples(start, op, step_mm=2.0):
     if kind not in MOVE_TYPES:
         return []
     end = pose(op)
+    if kind == "bezier":
+        waypoints=bezier_toolpath_points(start,op)
+        samples=[];prev=start
+        for pt in waypoints:
+            count=max(1,math.ceil(math.dist(prev[:3],pt[:3])/step_mm))
+            for i in range(1,count+1):
+                t=i/count
+                samples.append(tuple(prev[k]+(pt[k]-prev[k])*t for k in range(4)))
+            prev=pt
+        return samples
     if kind == "ptp":
         # Native joint PTP has no known TCP interpolation in this offline CAD.
         return [end]
@@ -324,6 +453,8 @@ def validate_project(project, include_unsupported=True):
     current = start
     for index, op in enumerate(project["operations"]):
         kind = op["type"]
+        if kind == "spindle":
+            continue
         if kind == "delay":
             if not 0 <= op["seconds"] <= 86400:
                 errors.append((index, "DELAY musi byt v intervalu 0..86400 s"))
@@ -332,16 +463,50 @@ def validate_project(project, include_unsupported=True):
             if include_unsupported:
                 errors.append((index, "WAIT INPUT: aktualni runner nema prikaz cekani na digitalni vstup."))
             continue
-        if kind == "ptp" and include_unsupported:
-            errors.append((index, "PTP: runner neumi export nativniho klouboveho PTP. Pouzij G0 (LINEAR), nebo pockej na rozsireni runneru."))
-        if kind in ("linear", "arc") and (op["feed"] <= 0 or not math.isfinite(op["feed"])):
+        if kind in ("ptp", "rotate"):
+            if not 0.01 <= op["ptp_speed"] <= 80.0:
+                errors.append((index, "PTP rychlost musi byt 0.01..80 procent"))
+            destination = endpoint(current, op, tool)
+            target_error = reachability_error(destination, tool)
+            if target_error:
+                errors.append((index, "Cil PTP/ROTATE: " + target_error))
+                states = []
+            else:
+                # PTP follows an unknown joint-space trajectory; do not
+                # incorrectly require small linear IK steps between endpoints.
+                states = SOLVER.check_target(*tool_to_flange(destination, tool))
+            current = destination
+            continue
+        if kind in ("text", "vector"):
+            try:
+                targets = text_toolpath_targets(current, op) if kind == "text" else vector_toolpath_targets(current, op)
+                for move_kind, destination in targets:
+                    sampled = path_samples(current, {"type": move_kind, "x":destination[0],
+                        "y":destination[1],"z":destination[2],"r":destination[3]})
+                    for pt in sampled:
+                        target_error = reachability_error(pt, tool)
+                        if target_error:
+                            raise ValueError("TEXT: " + target_error)
+                        if states:
+                            choices = SOLVER.check_target(*tool_to_flange(pt, tool))
+                            states = _joint_continuity(states, choices)
+                            if not states:
+                                raise ValueError("TEXT: mozny skok kloubu >10 stupnu (offline IK)")
+                    current = destination
+            except (ValueError, OverflowError, ZeroDivisionError) as exc:
+                errors.append((index, str(exc)))
+                states = []
+            continue
+        if kind in ("linear", "arc", "bezier") and abs(_joint_delta(op["r"], current[3])) > 1e-6:
+            errors.append((index, "LINEAR/CIRCULAR vyzaduje konstantni R; pro zmenu pouzij PTP/ROTATE"))
+        if kind in ("linear", "arc", "bezier") and (op["feed"] <= 0 or not math.isfinite(op["feed"])):
             errors.append((index, "F musi byt kladne (mm/min)"))
         # A single native G0/G1 maps a straight *flange* trajectory.
         # With a side-offset TCP and changing R, it would NOT be a straight
         # TCP trajectory. Refuse to export instead of silently changing path.
         side_offset = math.hypot(tool["x"], tool["y"]) > 1e-9
         r_delta = abs(_joint_delta(op["r"], current[3])) if kind in MOVE_TYPES else 0
-        if side_offset and r_delta > 1e-6 and kind in ("linear", "rapid") and include_unsupported:
+        if side_offset and r_delta > 1e-6 and kind in ("linear", "rapid", "bezier") and include_unsupported:
             errors.append((index, "LINEAR/G0 se zmenou R a bocnim TCP offsetem zatim nelze exportovat "
                                   "(skutecna TCP draha by nebyla primka). Rozdel pohyb."))
         try:
@@ -379,7 +544,7 @@ def validate_project(project, include_unsupported=True):
         except (ValueError, ZeroDivisionError, OverflowError) as exc:
             errors.append((index, str(exc)))
             states = []
-        current = endpoint(current, op)
+        current = endpoint(current, op, tool)
     return errors
 
 
@@ -389,8 +554,8 @@ def _n(number, digits=4):
     return f"{value:.{digits}f}"
 
 
-def generate_gcode(project):
-    """Generate machine-absolute G-code; rejects unsupported PTP and WAIT INPUT."""
+def _render_gcode(project):
+    """Generate machine-absolute G-code incl. nonmodal G100/G101 joint motions."""
     project = normalize_project(project)
     problems = validate_project(project)
     if problems:
@@ -406,7 +571,7 @@ def generate_gcode(project):
         "; ACTIVE TOOL: " + tool["name"],
         "; LOCAL FLANGE OFFSETS: " + " ".join(f"{a}{_n(tool[k])}" for a, k in zip("XYZR", ("x", "y", "z", "r"))),
         "; CONTROLLER TCP OFFSET MUST BE DISABLED WHEN CAD COMPENSATES",
-        "; G0 = LINEAR (CMD16), native joint PTP not supported",
+        "; G0 = LINEAR (CMD16); G100 = native joint PTP; G101 = rotation around flange A4",
         "G21 G90 G17 G91.1 G94",
         "G64",
     ]
@@ -438,12 +603,123 @@ def generate_gcode(project):
                 j = info["cy"] - current[1]
                 lines.append(f"{info['code']} X{_n(flange_end[0])} Y{_n(flange_end[1])} "
                              f"I{_n(i, 5)} J{_n(j, 5)} F{_n(op['feed'], 3)}")
+            elif kind == "bezier":
+                lines.append(f"; BEZIER G1 segments tolerance {op['tolerance']:g} mm")
+                for tcp in bezier_toolpath_points(current,op):
+                    machine = machine_pose(tcp,project)
+                    lines.append("G1 " + " ".join(f"{axis}{_n(value)}" for axis,value in zip("XYZR",machine))
+                                 + f" F{_n(op['feed'],3)}")
+            elif kind == "ptp":
+                lines.append("G100 " + " ".join(f"{axis}{_n(value)}" for axis, value in zip("XYZR", flange_end))
+                             + f" P{_n(op['ptp_speed'], 3)}")
+        elif kind == "rotate":
+            flange_r = op["r"] - tool["r"]
+            # Runner G101 leaves physical flange XYZ unchanged.
+            lines.append(f"G101 R{_n(flange_r)} P{_n(op['ptp_speed'], 3)}")
+        elif kind in ("text", "vector"):
+            if kind == "vector":
+                lines.append(f"; IMPORT {op['source']} | {len(op['paths'])} contours | rotation {op['angle_deg']:g} deg")
+                targets = vector_toolpath_targets(current,op)
             else:
-                raise AssertionError("PTP must be rejected by validation")
+                targets = text_toolpath_targets(current,op)
+            if kind == "text": lines.append(f"; SINGLE LINE TEXT: {op['text']} | XY rotation {op.get('angle_deg', 0.0):g} deg | TCP R inherited")
+            for motion, tcp in targets:
+                flange = machine_pose(tcp, project)
+                command = "G0" if motion == "rapid" else "G1"
+                line = command + " " + " ".join(f"{axis}{_n(value)}" for axis, value in zip("XYZR", flange))
+                if motion == "linear":
+                    line += f" F{_n(op['feed'], 3)}"
+                lines.append(line)
+        elif kind == "spindle":
+            lines.append("M3" if op["enabled"] else "M5")
         elif kind == "delay":
             lines.append(f"G4 P{_n(op['seconds'], 3)}")
         else:
             raise AssertionError("Unsupported operation escaped validation")
-        current = endpoint(current, op)
+        current = endpoint(current, op, tool)
     lines += ["M2", ""]
     return "\n".join(lines)
+
+
+# The controller accepts at most 16 native primitives per HYRING slot.
+# This is an offline approximation of the runner's *final* refill guard; the
+# runtime driver remains authoritative for the actual ring safety check.
+def refill_report(project, gcode=None):
+    """Estimate native HYRING refill windows over entire contiguous feed runs.
+
+    Returns violating windows; ignored CAD warnings do NOT change driver guard.
+    G0, G100, G101, spindle/dwell and program end flush native ring.
+    """
+    if gcode is None:
+        gcode = _render_gcode(project)
+    current = list(machine_pose(pose(project['start']),project))
+    primitives=[];windows=[]
+    block_counter=0
+
+    def flush():
+        nonlocal primitives, block_counter
+        blocks=[primitives[i:i+16] for i in range(0,len(primitives),16)]
+        if len(blocks)>=3:
+            for j in range(1,len(blocks)-1):
+                guard=blocks[j][:5]
+                available=sum(length/speed for length,speed in guard)
+                if available+1e-12<0.50:
+                    windows.append({'block':block_counter+j,'window_s':available,
+                                    'minimum_s':0.50,'max_feed_factor':available/0.50})
+        block_counter+=len(blocks)
+        primitives=[]
+
+    for original in gcode.splitlines():
+        line=original.split(';',1)[0].strip()
+        if not line:continue
+        words={key:float(val) for key,val in re.findall(
+            r'([A-Z])\s*([-+]?(?:\d+(?:\.\d*)?|\.\d+))',line)}
+        g=words.get('G')
+        if g is None:
+            if words.get('M') in (2,3,5,30):flush()
+            continue
+        if g in (0,100,101,4):
+            flush()
+            if g in (0,100):
+                for i,k in enumerate('XYZR'):
+                    if k in words:current[i]=words[k]
+            elif g==101 and 'R' in words:current[3]=words['R']
+            continue
+        if g not in (1,2,3):continue
+        end=[words.get(k,current[i]) for i,k in enumerate('XYZR')]
+        speed=words.get('F',600.)/60.
+        if speed<=0:continue
+        if g==1:
+            length=math.dist(current[:3],end[:3]);primitives.append((length,speed))
+        else:
+            cx=current[0]+words.get('I',0);cy=current[1]+words.get('J',0)
+            radius=math.hypot(current[0]-cx,current[1]-cy)
+            a0=math.atan2(current[1]-cy,current[0]-cx)
+            a1=math.atan2(end[1]-cy,end[0]-cx)
+            if math.dist(current[:2],end[:2])<0.001:
+                angle=2*math.pi
+            elif g==2:
+                angle=(a0-a1)%(2*math.pi)
+            else:
+                angle=(a1-a0)%(2*math.pi)
+            parts=max(1,math.ceil(angle/math.pi-1e-10))
+            primitives.extend([(radius*angle/parts,speed)]*parts)
+        current=end
+    flush()
+    return windows
+
+
+def generate_gcode(project):
+    """Safe-by-default export; override affects CAD warning only, NOT runner."""
+    code=_render_gcode(project)
+    windows=refill_report(project,code)
+    if windows:
+        smallest=min(windows,key=lambda item:item['window_s'])
+        if not project.get('ignore_refill_warning',False):
+            raise ValueError('HYRING REFILL: odhad pouze %.3f s (limit 0.500 s, buffer %d). '
+                             'Sniz F, zmen toleranci nebo pouzij Ignorovat *varovani v CADu*. '
+                             'Pozor: runner ma vlastni nezavislou kontrolu a pohyb muze odmitnout.' %
+                             (smallest['window_s'],smallest['block']))
+        code=code.replace('G21 G90',
+                          '; WARNING: CAD HYRING REFILL IGNORE=ON, RUNNER GUARD STAYS ACTIVE\nG21 G90',1)
+    return code
