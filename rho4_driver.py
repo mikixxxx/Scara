@@ -3560,10 +3560,10 @@ class Rho4:
         x,y,z,r = self.get_position()
         if axis == "X":
             x += direction*distance
-            x = max(self.X_MIN,min(self.X_MAX,x))
+            # x = max(self.X_MIN,min(self.X_MAX,x))
         elif axis == "Y":
             y += direction*distance
-            y = max(self.Y_MIN,min(self.Y_MAX,y))
+            # y = max(self.Y_MIN,min(self.Y_MAX,y))
         elif axis == "Z":
             z += direction*distance
             z = max(self.Z_MIN,min(self.Z_MAX,z))
