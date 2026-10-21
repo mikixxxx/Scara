@@ -15,23 +15,90 @@ from scara_kinematics import SR6Geometry, tool_to_flange, flange_to_tool
 from scara_stroke_font import strokes as stroke_text
 from scara_vectors import cubic_points, transform_paths, _clean_paths
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 DEFAULT_TOOL = {"name": "Bez nastroje", "x": 0.0, "y": 0.0, "z": 0.0, "r": 0.0}
 DEFAULT_START = {"x": 450.0, "y": 0.0, "z": 100.0, "r": 0.0}
+DEFAULT_PLACEMENT = {"x": 0.0, "y": 0.0, "z": 0.0, "r": 0.0}
 MOVE_TYPES = ("ptp", "rapid", "linear", "arc", "bezier")
-OP_TYPES = MOVE_TYPES + ("rotate", "text", "vector", "spindle", "delay", "wait_input")
+OP_TYPES = MOVE_TYPES + ("rotate", "text", "vector", "spindle", "delay", "wait_input", "loop_start", "loop_end")
 SOLVER = SR6Geometry()  # Purely offline; no connection code exists.
 
 
 def new_project():
     return {"schema": SCHEMA_VERSION, "name": "Novy projekt", "start": dict(DEFAULT_START),
-            "move_to_start": False, "operations": [],
+            "move_to_start": False, "placement": dict(DEFAULT_PLACEMENT), "operations": [],
             "tools": [dict(DEFAULT_TOOL)], "active_tool": DEFAULT_TOOL["name"],
             "tcp_compensate": False, "ignore_refill_warning": False}
 
 
 def pose(data):
     return tuple(float(data[key]) for key in ("x", "y", "z", "r"))
+
+
+def transform_xy(project, x, y):
+    """Sketch XY -> machine XY; rotate around the unchanged sketch START.
+
+    Placement X/Y/Z are offsets; placement R is artwork rotation only.
+    """
+    frame = project.get("placement", DEFAULT_PLACEMENT)
+    start = project["start"]
+    phi = math.radians(frame["r"])
+    c, si = math.cos(phi), math.sin(phi)
+    dx, dy = x - start["x"], y - start["y"]
+    return (start["x"] + frame["x"] + c*dx - si*dy,
+            start["y"] + frame["y"] + si*dx + c*dy)
+
+
+def inverse_xy(project, x, y):
+    """Machine XY -> original Sketch XY, for mouse editing at any placement."""
+    frame = project.get("placement", DEFAULT_PLACEMENT)
+    start = project["start"]
+    phi = math.radians(frame["r"])
+    c, si = math.cos(phi), math.sin(phi)
+    dx = x - start["x"] - frame["x"]
+    dy = y - start["y"] - frame["y"]
+    return (start["x"] + c*dx + si*dy,
+            start["y"] - si*dx + c*dy)
+
+
+def transform_pose(project, tcp):
+    x, y = transform_xy(project, tcp[0], tcp[1])
+    frame = project.get("placement", DEFAULT_PLACEMENT)
+    # Rotating the sketch does NOT rotate the TCP/flange orientation.
+    return (x, y, tcp[2] + frame["z"], tcp[3])
+
+
+def physical_project(project):
+    """Return a machine-absolute, neutral-frame model for validation and export.
+
+    The source project stays unchanged. Text/vector geometry is rotated exactly
+    once: their anchors and local artwork rotation are transformed separately.
+    Tool offsets remain in local flange coordinates (do not rotate them here).
+    The geometric rotation never changes any programmed TCP R, including ROTATE.
+    """
+    result = deepcopy(project)
+    frame = project.get("placement", DEFAULT_PLACEMENT)
+    if not any(abs(frame[k]) > 1e-12 for k in ("x", "y", "z", "r")):
+        result["placement"] = dict(DEFAULT_PLACEMENT)
+        return result
+    result["start"] = dict(zip(("x", "y", "z", "r"),
+                               transform_pose(project, pose(project["start"]))))
+    for op in result["operations"]:
+        kind = op["type"]
+        if kind in MOVE_TYPES or kind in ("text", "vector"):
+            op["x"], op["y"] = transform_xy(project, op["x"], op["y"])
+            op["z"] += frame["z"]
+        if kind in MOVE_TYPES:
+            if kind == "arc":
+                op["mx"], op["my"] = transform_xy(project, op["mx"], op["my"])
+            if kind == "bezier":
+                for k in ("c1", "c2"):
+                    op[k+"x"], op[k+"y"] = transform_xy(project,op[k+"x"],op[k+"y"])
+        elif kind in ("text", "vector"):
+            op["safe_z"] += frame["z"]
+            op["angle_deg"] += frame["r"]
+    result["placement"] = dict(DEFAULT_PLACEMENT)
+    return result
 
 
 def _clean_float(value, field):
@@ -115,13 +182,21 @@ def _has_tool_offset(tool):
 
 
 def normalize_project(obj):
-    if not isinstance(obj, dict) or obj.get("schema") not in (1, 2, 3, 4, 5, 6, SCHEMA_VERSION):
-        raise ValueError("Nepodporovana verze formatu projektu .scara (schema 1..7).")
+    if not isinstance(obj, dict) or obj.get("schema") not in range(1, SCHEMA_VERSION+1):
+        raise ValueError("Nepodporovana verze formatu projektu .scara (schema 1..8).")
     from_v01 = (obj["schema"] == 1)
     start = obj.get("start")
     if not isinstance(start, dict):
         raise ValueError("Projekt nema platny START XYZR.")
     clean_start = {k: _clean_float(start[k], f"start.{k}") for k in ("x", "y", "z", "r")}
+    placement = obj.get("placement", DEFAULT_PLACEMENT)
+    if not isinstance(placement, dict):
+        raise ValueError("Umisteni Sketch: ocekavan objekt.")
+    placement = {k: _clean_float(placement[k], f"placement.{k}")
+                 for k in ("x", "y", "z", "r")}
+    if any(abs(placement[k]) > (2000 if k != "r" else 360)
+           for k in placement):
+        raise ValueError("Umisteni Sketch je mimo podporovany rozsah (+/-2000 mm / 360 stupnu).")
     move_to_start = obj.get("move_to_start", False)
     if not isinstance(move_to_start, bool):
         raise ValueError("move_to_start musi byt true/false.")
@@ -188,6 +263,20 @@ def normalize_project(obj):
             op["paths"] = [[[float(a),float(b)] for a,b in poly]
                            for poly in _clean_paths(raw["paths"])]
             op["skipped"] = dict(raw.get("skipped", {}))
+        elif kind == "loop_start":
+            count = raw.get("count")
+            if type(count) is not int or not 1 <= count <= 100:
+                raise ValueError(f"LOOP START {no}: pocet opakovani musi byt cele cislo 1..100")
+            op["count"] = count
+        elif kind == "loop_end":
+            op["dz"] = _clean_float(raw["dz"], f"LOOP END {no}.dz")
+            op["safe_z"] = _clean_float(raw["safe_z"], f"LOOP END {no}.safe_z")
+            op["approach_feed"] = _clean_float(raw.get("approach_feed", 120.0),
+                                               f"LOOP END {no}.approach_feed")
+            if abs(op["dz"]) > 20 or not -100 <= op["safe_z"] <= 300:
+                raise ValueError(f"LOOP END {no}: krok Z max +/-20 mm, safe Z -100..300 mm")
+            if not 0.01 <= op["approach_feed"] <= 10000:
+                raise ValueError(f"LOOP END {no}: F ponoru musi byt 0.01..10000 mm/min")
         elif kind == "spindle":
             if not isinstance(raw.get("enabled"), bool):
                 raise ValueError(f"Operace {no}: SPINDLE enabled musi byt true/false")
@@ -204,12 +293,128 @@ def normalize_project(obj):
     return {
         "schema": SCHEMA_VERSION,
         "name": str(obj.get("name", "Novy projekt"))[:120],
-        "start": clean_start,
+        "start": clean_start, "placement": placement,
         "move_to_start": move_to_start,
         "tools": tools, "active_tool": active_name, "tcp_compensate": compensation,
         "ignore_refill_warning": ignore_refill,
         "operations": cleaned,
     }
+
+
+
+def _loop_rapid(target):
+    return dict(type="rapid", **dict(zip(("x", "y", "z", "r"), target)), feed=600.0)
+
+
+def _loop_plunge(target, feed):
+    return dict(type="linear", **dict(zip(("x", "y", "z", "r"), target)), feed=feed)
+
+
+def expand_loops(project):
+    """Unroll one-level LOOP blocks into regular moves before ANY validation/export.
+
+    Return (normalized expanded project, source op indices). All safety moves are
+    explicit G0 (straight LINEAR) or G1 (feed-limited Z plunge); no new runner
+    syntax. The LOOP Z delta applies only to cutting motions, not RAPID/PTP,
+    text/vector safe_z, or a dedicated safe return. No implicit robot motion
+    happens when leaving a loop: the final retraction is part of G-code.
+    """
+    result = deepcopy(project)
+    operations = result["operations"]
+    expanded = []
+    sources = []
+    tool = active_tool(result)
+    current = pose(result["start"])
+
+    def append(op, src):
+        nonlocal current
+        if len(expanded) >= 10000:
+            raise ValueError("LOOP: po rozbaleni vice nez 10000 operaci (zmensi pocet opakovani)")
+        expanded.append(op)
+        sources.append(src)
+        current = endpoint(current, op, tool)
+
+    i = 0
+    while i < len(operations):
+        op = operations[i]
+        if op["type"] == "loop_end":
+            raise ValueError(f"Operace {i+1}: LOOP END nema odpovidajici LOOP START")
+        if op["type"] != "loop_start":
+            append(deepcopy(op), i)
+            i += 1
+            continue
+        start_index = i
+        last = next((j for j in range(i+1,len(operations))
+                     if operations[j]["type"] == "loop_end"), None)
+        if last is None:
+            raise ValueError(f"Operace {i+1}: chybi LOOP END")
+        body = operations[i+1:last]
+        if any(x["type"] in ("loop_start", "loop_end") for x in body):
+            raise ValueError(f"Operace {i+1}: vnorene smycky zatim nejsou podporovany")
+        if not body or not any(x["type"] in MOVE_TYPES or x["type"] in ("text","vector","rotate") for x in body):
+            raise ValueError(f"Operace {i+1}: LOOP musi obsahovat pohyb")
+        setting = operations[last]
+        safe = setting["safe_z"]
+        entry = current
+        count = op["count"]
+        dz = setting["dz"]
+        # Verify safe plane and entire Z envelope, including the deepest pass.
+        # The local XY path and R may still be unreachable; normal validator
+        # checks each generated move after expansion.
+        z_values = [entry[2]]
+        working = []
+        for k in range(count):
+            offset = k * dz
+            for step in body:
+                kind = step["type"]
+                if kind in ("linear", "arc", "bezier", "text", "vector"):
+                    z = step["z"] + offset
+                    z_values.append(z)
+                    working.append(z)
+                elif kind in ("rapid", "ptp"):
+                    z_values.append(step["z"])
+                if kind in ("text", "vector"):
+                    z_values.append(step["safe_z"])
+            if entry[2] < safe - 0.5:
+                working.append(entry[2] + offset)
+                z_values.append(entry[2] + offset)
+        if max(z_values) > safe + 1e-8 or (working and max(working) > safe - 0.5 + 1e-8):
+            raise ValueError(f"Operace {last+1}: LOOP bezpecne Z {safe:g} neni nad celou drahou "
+                             "(alespon 0.5 mm nad pracovni Z)")
+        first_motion = next((step["type"] for step in body if step["type"] in MOVE_TYPES
+                             or step["type"] in ("text", "vector", "rotate")), None)
+        # TEXT and IMPORT already perform their own safe approach; RAPID and
+        # PTP have their own explicit target. Do not plunge into the surface
+        # before these commands. Only a G1/ARC/BEZIER path inherits the Z of
+        # the LOOP entry and needs its starting point shifted on a later pass.
+        need_entry_plunge = first_motion in ("linear", "arc", "bezier")
+        for k in range(count):
+            offset = k * dz
+            if k:
+                # Last pass ends retracted to safe Z, with its last XY.
+                # Straight travel stays in that plane. R must match the
+                # loop entry so the TCP does not curve with side offsets.
+                if abs(_joint_delta(current[3], entry[3])) > 1e-6:
+                    raise ValueError(f"Operace {last+1}: LOOP meni R; pred LOOP END vrat R na hodnotu pri LOOP START")
+                if math.dist(current[:2], entry[:2]) > 1e-8:
+                    append(_loop_rapid((entry[0], entry[1], safe, entry[3])), last)
+                if need_entry_plunge and entry[2] < safe - 0.5:
+                    append(_loop_plunge((entry[0],entry[1],entry[2]+offset,entry[3]),
+                                        setting["approach_feed"]), last)
+            for n, original in enumerate(body, start=start_index+1):
+                copy_op = deepcopy(original)
+                if copy_op["type"] in ("linear", "arc", "bezier", "text", "vector"):
+                    copy_op["z"] += offset
+                append(copy_op, n)
+            # Retraction also happens after the LAST pass. Nothing in G-code
+            # restores virtual offsets; following operations are absolute.
+            if abs(_joint_delta(current[3], entry[3])) > 1e-6:
+                raise ValueError(f"Operace {last+1}: LOOP meni R; pred LOOP END vrat R na hodnotu pri LOOP START")
+            if abs(current[2]-safe) > 1e-8:
+                append(_loop_rapid((current[0], current[1], safe, current[3])), last)
+        i = last + 1
+    result["operations"] = expanded
+    return result, sources
 
 
 def load_project(filename):
@@ -355,6 +560,8 @@ def endpoint(prev, op, tool=None):
     kind = op["type"]
     if kind in MOVE_TYPES:
         return pose(op)
+    if kind == "loop_end":
+        return (prev[0], prev[1], op["safe_z"], prev[3])
     if kind == "rotate":
         t = DEFAULT_TOOL if tool is None else tool
         flange = tool_to_flange(prev, t)
@@ -364,6 +571,23 @@ def endpoint(prev, op, tool=None):
     if kind == "vector":
         return vector_toolpath_targets(prev, op)[-1][1]
     return prev
+
+
+def display_endpoint(project, prev, op, tool=None):
+    """Endpoint expressed in sketch XY for the GUI, matching machine export.
+
+    Native G101 rotates the flange in place, not the offset tool's TCP.
+    Under geometric artwork rotation (with TCP R unchanged), computing that
+    TCP displacement in sketch coordinates would rotate the tool offset too.
+    For ROTATE, compute in machine XY and map back to sketch XY instead.
+    """
+    if op["type"] != "rotate":
+        return endpoint(prev, op, tool)
+    machine_prev = transform_pose(project, prev)
+    machine_end = endpoint(machine_prev, op, tool)
+    sketch_x, sketch_y = inverse_xy(project, machine_end[0], machine_end[1])
+    dz = project.get("placement", DEFAULT_PLACEMENT)["z"]
+    return (sketch_x, sketch_y, machine_end[2] - dz, machine_end[3])
 
 
 def path_samples(start, op, step_mm=2.0):
@@ -433,6 +657,17 @@ def _joint_continuity(previous, possibilities, maximum=10.0):
 
 
 def validate_project(project, include_unsupported=True):
+    """Validate transformed machine targets, keeping original Sketch unmodified."""
+    try:
+        normalized = normalize_project(project)
+        expanded, source_ix = expand_loops(normalized)
+    except (ValueError, KeyError, TypeError) as exc:
+        return [(-1, str(exc))]
+    errors = _validate_project_machine(physical_project(expanded), include_unsupported)
+    return [(source_ix[ix] if ix >= 0 else -1, message) for ix, message in errors]
+
+
+def _validate_project_machine(project, include_unsupported=True):
     """Return [(op_index_or_-1, description)] errors, offline advisory only.
 
     As with the driver, samples are ~2 mm / 5 deg; actual controller constraints,
@@ -557,24 +792,47 @@ def _n(number, digits=4):
 def _render_gcode(project):
     """Generate machine-absolute G-code incl. nonmodal G100/G101 joint motions."""
     project = normalize_project(project)
-    problems = validate_project(project)
+    source_start = pose(project["start"])
+    placement = project["placement"]
+    source_ops = project["operations"]
+    loop_comments = []
+    for start_ix, marker in enumerate(source_ops):
+        if marker["type"] != "loop_start":
+            continue
+        end_ix = next((j for j in range(start_ix+1, len(source_ops))
+                       if source_ops[j]["type"] == "loop_end"), None)
+        if end_ix is not None:
+            setting = source_ops[end_ix]
+            loop_comments.append(
+                f"; LOOP SKETCH {start_ix+1:03d}..{end_ix+1:03d}: "
+                f"{marker['count']} passes, dZ {_n(setting['dz'])} mm/pass, "
+                f"SAFE Z {_n(setting['safe_z'])}; expanded to absolute moves")
+    project, source_ix = expand_loops(project)
+    project = physical_project(project)
+    problems = _validate_project_machine(project)
     if problems:
         raise ValueError("Export zablokovan:\n" + "\n".join(
-            (f"START: {msg}" if ix == -1 else f"Operace {ix+1}: {msg}")
+            (f"START: {msg}" if ix == -1 else f"Operace {source_ix[ix]+1}: {msg}")
             for ix, msg in problems))
     tool = active_tool(project)
     start_machine = machine_pose(pose(project["start"]), project)
     lines = [
         "; SCARA CAD SR6 - G-code for rho4_gcode_runner.py",
+        "; SKETCH PLACEMENT (XYZ offset, artwork XY rotation; TCP R unchanged): " +
+            " ".join(f"{a}{_n(placement[k])}" for a, k in zip("XYZR", ("x", "y", "z", "r"))),
+        "; ORIGINAL SKETCH START TCP: " +
+            " ".join(f"{a}{_n(v)}" for a, v in zip("XYZR", source_start)),
         "; MACHINE ABSOLUTE COORDINATES: RUN WITH --machine-coordinates",
         "; START TCP: " + " ".join(f"{a}{_n(v)}" for a, v in zip("XYZR", pose(project["start"]))),
         "; ACTIVE TOOL: " + tool["name"],
         "; LOCAL FLANGE OFFSETS: " + " ".join(f"{a}{_n(tool[k])}" for a, k in zip("XYZR", ("x", "y", "z", "r"))),
         "; CONTROLLER TCP OFFSET MUST BE DISABLED WHEN CAD COMPENSATES",
         "; G0 = LINEAR (CMD16); G100 = native joint PTP; G101 = rotation around flange A4",
+        "; LOOP commands were expanded in CAD; no G91 or runtime loops",
         "G21 G90 G17 G91.1 G94",
         "G64",
     ]
+    lines.extend(loop_comments)
     if project["move_to_start"]:
         lines.extend([
             "; MOVE TO START ENABLED: G0 LINEAR from ACTUAL robot position",
@@ -584,9 +842,13 @@ def _render_gcode(project):
     else:
         lines.append("; MOVE TO START DISABLED: robot MUST already be at START")
     current = pose(project["start"])
+    last_source = -1
     for ix, op in enumerate(project["operations"], 1):
         kind = op["type"]
-        lines.append(f"; {ix:03d} {kind.upper()}")
+        source = source_ix[ix-1]
+        if source != last_source:
+            lines.append(f"; SKETCH {source+1:03d} | {kind.upper()}")
+            last_source = source
         if kind in MOVE_TYPES:
             # All movement types have a non-optional target pose.
             flange_end = machine_pose(pose(op), project)
@@ -652,7 +914,8 @@ def refill_report(project, gcode=None):
     """
     if gcode is None:
         gcode = _render_gcode(project)
-    current = list(machine_pose(pose(project['start']),project))
+    placed = physical_project(project)
+    current = list(machine_pose(pose(placed['start']),placed))
     primitives=[];windows=[]
     block_counter=0
 

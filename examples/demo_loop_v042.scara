@@ -1,0 +1,19 @@
+{
+  "schema": 8,
+  "name": "Demo LOOP: 4 vrstvy Z -0.1mm",
+  "start": {"x": 300.0, "y": 300.0, "z": 180.0, "r": 0.0},
+  "move_to_start": false,
+  "placement": {"x": 0.0, "y": 0.0, "z": 0.0, "r": 0.0},
+  "operations": [
+    {"type": "loop_start", "count": 4},
+    {"type": "vector", "source": "demo_ctverec.svg", "x": 300.0, "y": 300.0,
+     "z": 179.0, "safe_z": 185.0, "angle_deg": 0.0, "scale": 1.0,
+     "feed": 120.0, "paths": [[[0, 0], [10, 0], [10, 10], [0, 10], [0, 0]]], "skipped": {}},
+    {"type": "loop_end", "dz": -0.1, "safe_z": 185.0, "approach_feed": 90.0},
+    {"type": "rapid", "x": 320.0, "y": 300.0, "z": 185.0, "r": 0.0, "feed": 600.0}
+  ],
+  "tools": [{"name": "Bez nastroje", "x": 0.0, "y": 0.0, "z": 0.0, "r": 0.0}],
+  "active_tool": "Bez nastroje",
+  "tcp_compensate": false,
+  "ignore_refill_warning": false
+}

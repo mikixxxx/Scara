@@ -1,4 +1,4 @@
-"""SCARA CAD SR6 v0.3.0 - standalone offline trajectory sketch editor."""
+"""SCARA CAD SR6 v0.4.2 - KISS offline trajectory sketch editor."""
 from __future__ import annotations
 
 import copy
@@ -23,8 +23,10 @@ from scara_core import (
     active_tool, machine_pose, normalize_tools, DEFAULT_TOOL,
     create_tool_profile, rename_tool_profile, remove_tool_profile, text_toolpath_targets,
     _has_tool_offset, vector_toolpath_targets, bezier_toolpath_points,
-    refill_report,
+    refill_report, transform_xy, inverse_xy, transform_pose, physical_project,
+    display_endpoint,
 )
+from scara_preflight import analyze_gcode
 from scara_vectors import import_vectors, transform_paths
 
 COLOR_BG = QColor("#0e1721")
@@ -63,10 +65,11 @@ class SketchCanvas(QWidget):
 
     def rebuild_reachability(self):
         start = self.owner.project["start"]
-        z = start["z"]
+        z = start["z"] + self.owner.project.get("placement", {}).get("z", 0.0)
         r_widget = getattr(self.owner, "mask_r_spin", None)
         linked = getattr(self.owner, "mask_link_checkbox", None)
-        r = start["r"] if r_widget is None or linked is None or linked.isChecked() else r_widget.value()
+        r = (start["r"] if r_widget is None or linked is None or linked.isChecked()
+             else r_widget.value())
         tool = active_tool(self.owner.project)
         cells = []
         step = MASK_CELL_SIZE
@@ -86,15 +89,22 @@ class SketchCanvas(QWidget):
         view_size = 2.0 * (half_range + 25)
         return max(.04, min((self.width()-48)/view_size, (self.height()-55)/view_size)) * self.zoom
 
-    def to_screen(self, x, y):
+    def to_screen_machine(self, x, y):
+        """Robot XY; axes and reachability mask must NOT follow Sketch placement."""
         s = self.scale()
         return QPointF(self.width()*.5 + self.pan_x + x*s,
                        self.height()*.5 + self.pan_y - y*s)
 
+    def to_screen(self, x, y):
+        """Sketch coordinates drawn at their physically placed XY position."""
+        return self.to_screen_machine(*transform_xy(self.owner.project, x, y))
+
     def to_world(self, p):
+        """Mouse pixel -> Sketch XY (not machine XY), including rotation."""
         s = self.scale()
-        return ((p.x() - self.width()*.5 - self.pan_x)/s,
-                -(p.y() - self.height()*.5 - self.pan_y)/s)
+        machine_x = (p.x() - self.width()*.5 - self.pan_x)/s
+        machine_y = -(p.y() - self.height()*.5 - self.pan_y)/s
+        return inverse_xy(self.owner.project, machine_x, machine_y)
 
     def snapped(self, xy):
         if not self.owner.snap_checkbox.isChecked():
@@ -105,6 +115,12 @@ class SketchCanvas(QWidget):
     def _draw_marker(self, painter, xy, color, selected=False, hollow=False):
         pt = self.to_screen(xy[0], xy[1])
         painter.setPen(QPen(COLOR_SELECT if selected else QColor("#10202c"), 2.0))
+        painter.setBrush(QBrush(QColor("#0e1721") if hollow else color))
+        painter.drawEllipse(pt, MARKER_RADIUS, MARKER_RADIUS)
+
+    def _draw_machine_marker(self, painter, machine_pose_xy, color, hollow=False):
+        pt = self.to_screen_machine(machine_pose_xy[0], machine_pose_xy[1])
+        painter.setPen(QPen(QColor("#10202c"), 2))
         painter.setBrush(QBrush(QColor("#0e1721") if hollow else color))
         painter.drawEllipse(pt, MARKER_RADIUS, MARKER_RADIUS)
 
@@ -119,12 +135,12 @@ class SketchCanvas(QWidget):
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(QColor("#174038"))
         for x, y in self._mask:
-            pt = self.to_screen(x-MASK_CELL_SIZE/2, y+MASK_CELL_SIZE/2)
+            pt = self.to_screen_machine(x-MASK_CELL_SIZE/2, y+MASK_CELL_SIZE/2)
             p.drawRect(QRectF(pt.x(), pt.y(), MASK_CELL_SIZE*s+0.5, MASK_CELL_SIZE*s+0.5))
         p.setBrush(Qt.BrushStyle.NoBrush)
         if not _has_tool_offset(tool):
             p.setPen(QPen(QColor("#415f68"), 1, Qt.PenStyle.DashLine))
-            pc = self.to_screen(0, 0)
+            pc = self.to_screen_machine(0, 0)
             p.drawEllipse(pc, SOLVER.XY_RADIUS_MAX*s, SOLVER.XY_RADIUS_MAX*s)
         # Cartesian grid is a visual guide, not a square motion boundary.
         extent = int(math.ceil(GRID_HALF_SIZE + math.hypot(tool["x"], tool["y"])))
@@ -132,26 +148,26 @@ class SketchCanvas(QWidget):
             strong = (v % 100 == 0)
             col = QColor("#496373") if strong else COLOR_GRID
             p.setPen(QPen(col, 1 if strong else .65))
-            p.drawLine(self.to_screen(v, -extent), self.to_screen(v, extent))
-            p.drawLine(self.to_screen(-extent, v), self.to_screen(extent, v))
+            p.drawLine(self.to_screen_machine(v, -extent), self.to_screen_machine(v, extent))
+            p.drawLine(self.to_screen_machine(-extent, v), self.to_screen_machine(extent, v))
         p.setPen(QPen(COLOR_AXIS, 1.5))
-        p.drawLine(self.to_screen(-extent, 0), self.to_screen(extent, 0))
-        p.drawLine(self.to_screen(0, -extent), self.to_screen(0, extent))
+        p.drawLine(self.to_screen_machine(-extent, 0), self.to_screen_machine(extent, 0))
+        p.drawLine(self.to_screen_machine(0, -extent), self.to_screen_machine(0, extent))
         p.setPen(QColor("#b9cad9"))
-        p.drawText(self.to_screen(extent, 0)+QPointF(5, -5), "X+")
-        p.drawText(self.to_screen(0, extent)+QPointF(6, -7), "Y+")
-        p.drawText(self.to_screen(0, 0)+QPointF(6, 15), "0,0")
+        p.drawText(self.to_screen_machine(extent, 0)+QPointF(5, -5), "X+")
+        p.drawText(self.to_screen_machine(0, extent)+QPointF(6, -7), "Y+")
+        p.drawText(self.to_screen_machine(0, 0)+QPointF(6, 15), "0,0")
         flange_overlay = getattr(self.owner, "show_flange", None)
         show_flange = (flange_overlay is not None and flange_overlay.isChecked())
         # Draw configured initial TCP point (not automatically sent to robot).
         previous = pose(self.owner.project["start"])
         if show_flange:
-            flange = machine_pose(previous, self.owner.project)
+            flange = machine_pose(transform_pose(self.owner.project, previous), self.owner.project)
             p.setPen(QPen(COLOR_FLANGE, 1.4, Qt.PenStyle.DashLine))
-            p.drawLine(self.to_screen(*previous[:2]), self.to_screen(*flange[:2]))
-            self._draw_marker(p, flange, COLOR_FLANGE, hollow=True)
+            p.drawLine(self.to_screen(*previous[:2]), self.to_screen_machine(*flange[:2]))
+            self._draw_machine_marker(p, flange, COLOR_FLANGE, hollow=True)
             p.setPen(COLOR_FLANGE)
-            p.drawText(self.to_screen(*flange[:2])+QPointF(10, 12), "A4")
+            p.drawText(self.to_screen_machine(*flange[:2])+QPointF(10, 12), "A4")
         self._draw_marker(p, previous, COLOR_START, selected=self.owner.selected == -2)
         p.setPen(COLOR_START)
         p.drawText(self.to_screen(*previous[:2])+QPointF(10, -9), "START")
@@ -160,7 +176,7 @@ class SketchCanvas(QWidget):
             selected = index == self.owner.selected
             if kind == "rotate":
                 # End TCP is displaced by any tool offset; flange XY stays fixed.
-                end = endpoint(previous, op, tool)
+                end = display_endpoint(self.owner.project, previous, op, tool)
                 self._draw_marker(p, end, COLOR_PTP, selected=selected)
                 p.setPen(COLOR_SELECT if selected else COLOR_PTP)
                 p.drawText(self.to_screen(*end[:2])+QPointF(10, -9), f"R{op['r']:g}°")
@@ -229,28 +245,33 @@ class SketchCanvas(QWidget):
                     p.drawLine(self.to_screen(*previous[:2]), self.to_screen(*end[:2]))
                 if show_flange:
                     # Dashed machine/flange preview. Native PTP is not simulated.
-                    flange_start = machine_pose(previous, self.owner.project)
-                    flange_end = machine_pose(end, self.owner.project)
+                    flange_start = machine_pose(transform_pose(self.owner.project,previous), self.owner.project)
+                    flange_end = machine_pose(transform_pose(self.owner.project,end), self.owner.project)
                     if kind in ("arc", "bezier"):
                         try:
-                            fpts = [flange_start] + [machine_pose(pt, self.owner.project)
+                            fpts = [flange_start] + [machine_pose(transform_pose(self.owner.project,pt), self.owner.project)
                                                       for pt in path_samples(previous, op, step_mm=8.0)]
                             p.setPen(QPen(COLOR_FLANGE, 1.2, Qt.PenStyle.DashLine))
-                            p.drawPolyline(QPolygonF([self.to_screen(*pt[:2]) for pt in fpts]))
+                            p.drawPolyline(QPolygonF([self.to_screen_machine(*pt[:2]) for pt in fpts]))
                         except ValueError:
                             pass
                     elif kind != "ptp":
                         p.setPen(QPen(COLOR_FLANGE, 1.2, Qt.PenStyle.DashLine))
-                        p.drawLine(self.to_screen(*flange_start[:2]), self.to_screen(*flange_end[:2]))
+                        p.drawLine(self.to_screen_machine(*flange_start[:2]), self.to_screen_machine(*flange_end[:2]))
                     # Native PTP flange path is unknown; only its endpoint
                     # can be displayed as a valid candidate position.
                     if selected:
-                        p.drawLine(self.to_screen(*end[:2]), self.to_screen(*flange_end[:2]))
-                    self._draw_marker(p, flange_end, COLOR_FLANGE, hollow=True)
+                        p.drawLine(self.to_screen(*end[:2]), self.to_screen_machine(*flange_end[:2]))
+                    self._draw_machine_marker(p, flange_end, COLOR_FLANGE, hollow=True)
                 self._draw_marker(p, end, color, selected=selected and self.owner.selected_part != "mid")
                 p.setPen(QColor("#dae6ee") if selected else color)
                 p.drawText(self.to_screen(*end[:2])+QPointF(8, -8), f"P{index+1}")
                 previous = end
+            elif kind in ("loop_start", "loop_end"):
+                pt = self.to_screen(*previous[:2]) + QPointF(9, 24 if kind == "loop_end" else 12)
+                p.setPen(COLOR_SELECT if selected else QColor("#b4c4d3"))
+                p.drawText(pt, f"LOOP {'END' if kind == 'loop_end' else 'START'}")
+                previous = endpoint(previous, op, tool)
             elif kind == "delay":
                 pt = self.to_screen(*previous[:2]) + QPointF(9, 12)
                 p.setPen(COLOR_SELECT if selected else QColor("#bbc9d4"))
@@ -268,12 +289,15 @@ class SketchCanvas(QWidget):
             if self._cursor_world is not None:
                 p.drawLine(self.to_screen(*mid), self.to_screen(*self._cursor_world))
         p.setPen(QColor("#b4c4d3"))
-        mask_r = (self.owner.project["start"]["r"] if not hasattr(self.owner, "mask_link_checkbox")
+        placed_start = transform_pose(self.owner.project, pose(self.owner.project["start"]))
+        mask_r = (placed_start[3] if not hasattr(self.owner, "mask_link_checkbox")
                   or self.owner.mask_link_checkbox.isChecked() else self.owner.mask_r_spin.value())
-        p.drawText(12, 22, f"SR6 / TCP XY [mm] | nastroj: {tool['name']} | mapa Z={self.owner.project['start']['z']:.1f}, R={mask_r:.1f}")
+        p.drawText(12, 22, f"SR6 / TCP XY [mm] | nastroj: {tool['name']} | mapa Z={placed_start[2]:.1f}, R={mask_r:.1f}")
         if self._cursor_world is not None:
             x, y = self._cursor_world
-            p.drawText(12, self.height()-13, f"X {x:+.3f}    Y {y:+.3f}    | Zoom {self.zoom*100:.0f}%")
+            mx, my = transform_xy(self.owner.project, x, y)
+            p.drawText(12, self.height()-13,
+                       f"Sketch X {x:+.2f} Y {y:+.2f}  |  Stroj X {mx:+.2f} Y {my:+.2f}  |  Zoom {self.zoom*100:.0f}%")
         p.end()
 
     def _hit(self, pt):
@@ -334,8 +358,13 @@ class SketchCanvas(QWidget):
             index, part, _ = self._drag
             x, y = self._cursor_world
             if index == -2:
-                self.owner.project["start"]["x"] = x
-                self.owner.project["start"]["y"] = y
+                # START is the rotation pivot: its physically displayed XY is
+                # START + placement XY. Do not use the inverse rotation here,
+                # otherwise a rotated project causes the marker to jump.
+                mx, my = transform_xy(self.owner.project, x, y)
+                frame = self.owner.project["placement"]
+                self.owner.project["start"]["x"] = mx - frame["x"]
+                self.owner.project["start"]["y"] = my - frame["y"]
             elif part == "mid":
                 self.owner.project["operations"][index]["mx"] = x
                 self.owner.project["operations"][index]["my"] = y
@@ -360,8 +389,9 @@ class SketchCanvas(QWidget):
         factor = 1.15 if event.angleDelta().y() > 0 else (1/1.15)
         self.zoom = min(12.0, max(.25, self.zoom * factor))
         new_s = self.scale()
-        self.pan_x = event.position().x()-self.width()*.5-old_at_cursor[0]*new_s
-        self.pan_y = event.position().y()-self.height()*.5+old_at_cursor[1]*new_s
+        mx, my = transform_xy(self.owner.project, *old_at_cursor)
+        self.pan_x = event.position().x()-self.width()*.5-mx*new_s
+        self.pan_y = event.position().y()-self.height()*.5+my*new_s
         self.update()
 
     def reset_view(self):
@@ -391,7 +421,7 @@ class MainWindow(QMainWindow):
         self.arc_mid = None
         self.tool = "select"
         self._building = False
-        self.setWindowTitle("SCARA CAD SR6 – v0.2.1")
+        self.setWindowTitle("SCARA CAD SR6 – v0.4.2")
         self.resize(1450, 900)
         self.setMinimumSize(980, 650)
         self._build_ui()
@@ -448,6 +478,14 @@ class MainWindow(QMainWindow):
         import_btn.setToolTip("Jedna editovatelna operace Sketch, vektorove kontury uvnitr .scara")
         import_btn.clicked.connect(self.add_vector)
         left.addWidget(import_btn)
+        loop_start_btn = QPushButton("[  LOOP START")
+        loop_start_btn.setToolTip("Pocatek bloku s poctem opakovani. Vnorene smycky nejsou podporovany.")
+        loop_start_btn.clicked.connect(self.add_loop_start)
+        left.addWidget(loop_start_btn)
+        loop_end_btn = QPushButton("]  LOOP END")
+        loop_end_btn.setToolTip("Konec bloku: zmena pracovniho Z pro dalsi pruchod a bezpecne Z.")
+        loop_end_btn.clicked.connect(self.add_loop_end)
+        left.addWidget(loop_end_btn)
         spindle_on_btn = QPushButton("▶  Vreteno ON / M3")
         spindle_on_btn.clicked.connect(lambda: self.add_spindle(True))
         left.addWidget(spindle_on_btn)
@@ -555,6 +593,27 @@ class MainWindow(QMainWindow):
         tool_note.setWordWrap(True)
         tool_layout.addWidget(tool_note)
         right_lay.addWidget(tool_group)
+
+        placement_group = QGroupBox("Umisteni celeho Sketch na obrobku")
+        place_form = QFormLayout(placement_group)
+        self.placement_spins = {}
+        for key, label, lo, hi in (
+            ("x", "Posun X [mm]", -2000, 2000),
+            ("y", "Posun Y [mm]", -2000, 2000),
+            ("z", "Posun Z [mm]", -2000, 2000),
+            ("r", "Otoceni kresby XY [°]", -360, 360),
+        ):
+            sp = self._number(lo, hi, 3)
+            sp.editingFinished.connect(self.commit_placement)
+            self.placement_spins[key] = sp
+            place_form.addRow(label, sp)
+        place_note = QLabel("Otoceni kresby probiha kolem 00 START a meni pouze XY geometrii, "
+                            "nikoliv orientaci TCP R ani zakladnu robota. "
+                            "TCP R men jen v operacich. Neprovadi fyzicke nulovani.")
+        place_note.setWordWrap(True)
+        place_note.setObjectName("mutedLabel")
+        place_form.addRow(place_note)
+        right_lay.addWidget(placement_group)
 
         sketch_group = QGroupBox("Sketch / poradi operaci")
         sketch_lay = QVBoxLayout(sketch_group)
@@ -698,8 +757,34 @@ class MainWindow(QMainWindow):
             ("feed","F [mm/min]",0.01,100000,2)]:
             w=self._number(lo,hi,dec);w.editingFinished.connect(self.commit_properties)
             vform.addRow(label,w);self.vector_spins[k]=w
-        vform.addRow(QLabel("R TCP dedi z predchozi operace; kontury jsou ulozeny v projektu.",wordWrap=True))
+        vform.addRow(QLabel("R TCP dedi z predchozi operace; kontury jsou ulozeny v projektu."))
         self.prop_stack.addWidget(vector_page)  # index 8
+        loop_start_page = QWidget(); loop_start_form = QFormLayout(loop_start_page)
+        self.loop_count_spin = QSpinBox(); self.loop_count_spin.setRange(1, 100)
+        self.loop_count_spin.editingFinished.connect(self.commit_properties)
+        loop_start_form.addRow("Pocet pruchodu", self.loop_count_spin)
+        loop_start_note = QLabel("Operace az po LOOP END se provedou tolikrat. "
+                                 "Vnorene smycky v teto verzi nepovolujeme.")
+        loop_start_note.setWordWrap(True); loop_start_form.addRow(loop_start_note)
+        self.prop_stack.addWidget(loop_start_page)  # index 9
+        loop_end_page = QWidget(); loop_end_form = QFormLayout(loop_end_page)
+        self.loop_end_spins = {}
+        for key, label, low, high, digits in [
+            ("dz", "Prirustek Z / pruchod [mm]", -20, 20, 3),
+            ("safe_z", "Bezpecne Z [mm]", -100, 300, 3),
+            ("approach_feed", "F ponoru [mm/min]", 0.01, 10000, 2),
+        ]:
+            sp = self._number(low, high, digits)
+            sp.editingFinished.connect(self.commit_properties)
+            loop_end_form.addRow(label, sp)
+            self.loop_end_spins[key] = sp
+        loop_end_note = QLabel("Nahled ukazuje jeden pruchod; G-code obsahuje vsechny. "
+                               "Krok Z plati jen pro pracovni drahy G1/G2/G3/BEZIER, TEXT a IMPORT. "
+                               "G0, PTP a prejezdove Z zustavaji beze zmeny. "
+                               "Mezi pruchody: zdvih Z, prejezd LINEAR G0 a pripadny ponor G1. "
+                               "Po poslednim pruchodu zustane TCP na bezpecnem Z.")
+        loop_end_note.setWordWrap(True); loop_end_form.addRow(loop_end_note)
+        self.prop_stack.addWidget(loop_end_page)  # index 10
         right_lay.addWidget(self.properties)
 
         self.tabs = QTabWidget()
@@ -753,7 +838,7 @@ class MainWindow(QMainWindow):
 
     def _update_title(self):
         name = Path(self.filename).name if self.filename else "bez nazvu.scara"
-        self.setWindowTitle(f"SCARA CAD SR6 – {name}{' *' if self.changed else ''}")
+        self.setWindowTitle(f"SCARA CAD SR6 v0.4.0 – {name}{' *' if self.changed else ''}")
 
     def change_tool(self, tool):
         self.tool = tool
@@ -774,7 +859,7 @@ class MainWindow(QMainWindow):
         prior = pose(self.project["start"])
         for op in self.project["operations"][:self.insertion_index()]:
             try:
-                prior = endpoint(prior, op, active_tool(self.project))
+                prior = display_endpoint(self.project, prior, op, active_tool(self.project))
             except ValueError:
                 pass
         return prior
@@ -862,6 +947,22 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self,"Vynechane prvky",
                                 "Neimportovane typy: "+str(imported['skipped']))
 
+    def add_loop_start(self):
+        before = copy.deepcopy(self.project)
+        ix = self.insertion_index()
+        self.project["operations"].insert(ix, {"type":"loop_start", "count":3})
+        self.finish_change(before, ix, "LOOP START – vloz obsah smycky a LOOP END")
+
+    def add_loop_end(self):
+        before = copy.deepcopy(self.project)
+        ix = self.insertion_index()
+        current = self.insertion_start()
+        self.project["operations"].insert(ix, {
+            "type":"loop_end", "dz":-0.1,
+            "safe_z":min(195.0, current[2]+10.0), "approach_feed":120.0,
+        })
+        self.finish_change(before, ix, "LOOP END – over bezpecne Z a krok Z")
+
     def commit_ignore_refill(self, enabled):
         if self._building:return
         before=copy.deepcopy(self.project)
@@ -904,6 +1005,8 @@ class MainWindow(QMainWindow):
             for k, sp in self.start_spins.items():
                 sp.setValue(self.project["start"][k])
             self.start_move_checkbox.setChecked(self.project["move_to_start"])
+            for k, sp in self.placement_spins.items():
+                sp.setValue(self.project.get("placement", {}).get(k, 0.0))
             self.tool_combo.clear()
             self.tool_combo.addItems([t["name"] for t in self.project["tools"]])
             self.tool_combo.setCurrentText(self.project["active_tool"])
@@ -915,7 +1018,7 @@ class MainWindow(QMainWindow):
             self.tcp_compensate_box.setChecked(self.project["tcp_compensate"])
             self.ignore_refill_checkbox.setChecked(self.project.get('ignore_refill_warning',False))
             if self.mask_link_checkbox.isChecked():
-                self.mask_r_spin.setValue(self.project["start"]["r"])
+                self.mask_r_spin.setValue(transform_pose(self.project,pose(self.project["start"]))[3])
             for button in self.operation_buttons:
                 button.setEnabled(0 <= self.selected < len(self.project["operations"]))
             if self.selected == -2:
@@ -929,6 +1032,13 @@ class MainWindow(QMainWindow):
             if kind == 'bezier':
                 self.prop_stack.setCurrentIndex(7)
                 for k,sp in self.bezier_spins.items():sp.setValue(op[k])
+            elif kind == "loop_start":
+                self.prop_stack.setCurrentIndex(9)
+                self.loop_count_spin.setValue(op["count"])
+            elif kind == "loop_end":
+                self.prop_stack.setCurrentIndex(10)
+                for k, sp in self.loop_end_spins.items():
+                    sp.setValue(op[k])
             elif kind == 'vector':
                 self.prop_stack.setCurrentIndex(8)
                 self.vector_name.setText(f"{op['source']} ({len(op['paths'])} kontur)")
@@ -962,7 +1072,7 @@ class MainWindow(QMainWindow):
                     sp.setValue(op.get(k, 0.0))
                 prior = pose(self.project["start"])
                 for step in self.project["operations"][:self.selected]:
-                    try: prior = endpoint(prior, step, active_tool(self.project))
+                    try: prior = display_endpoint(self.project, prior, step, active_tool(self.project))
                     except ValueError: break
                 self.text_robot_r_label.setText(f"{prior[3]:.3f}° (z predchoziho kroku)")
             elif kind == "delay":
@@ -1088,12 +1198,21 @@ class MainWindow(QMainWindow):
     def preview_r_link_changed(self, checked):
         self.mask_r_spin.setEnabled(not checked)
         if checked:
-            self.mask_r_spin.setValue(self.project["start"]["r"])
+            self.mask_r_spin.setValue(transform_pose(self.project,pose(self.project["start"]))[3])
         self.canvas.rebuild_reachability()
 
     def preview_r_changed(self, _value):
         if not self._building and not self.mask_link_checkbox.isChecked():
             self.canvas.rebuild_reachability()
+
+    def commit_placement(self):
+        if self._building: return
+        before = copy.deepcopy(self.project)
+        for k, sp in self.placement_spins.items():
+            self.project["placement"][k] = sp.value()
+        # Only physical Z changes the reachability mask; geometric rotation/XY shift do not.
+        z_changed = abs(self.project["placement"]["z"] - before["placement"]["z"]) > 1e-10
+        self.finish_change(before, self.selected, "Umisteni celeho Sketch upraveno", re_mask=z_changed)
 
     def commit_start(self):
         if self._building: return
@@ -1112,7 +1231,11 @@ class MainWindow(QMainWindow):
         if self._building or not 0 <= self.selected < len(self.project["operations"]): return
         before = copy.deepcopy(self.project)
         op = self.project["operations"][self.selected]
-        if op['type']=='bezier':
+        if op["type"] == "loop_start":
+            op["count"] = self.loop_count_spin.value()
+        elif op["type"] == "loop_end":
+            for k, sp in self.loop_end_spins.items():op[k] = sp.value()
+        elif op['type']=='bezier':
             for k,sp in self.bezier_spins.items():op[k]=sp.value()
         elif op['type']=='vector':
             for k,sp in self.vector_spins.items():op[k]=sp.value()
@@ -1180,6 +1303,11 @@ class MainWindow(QMainWindow):
                     label = ("PTP G100" if kind == "ptp" else ("RAPID G0" if kind == "rapid" else
                              ("LINEAR" if kind == "linear" else "ARC G2/G3")))
                     description = f"X{op['x']:.1f} Y{op['y']:.1f} Z{op['z']:.1f} R{op['r']:.1f}°"
+                elif kind == "loop_start":
+                    label = "LOOP START"; description = f"{op['count']}x"
+                elif kind == "loop_end":
+                    label = "LOOP END"; description = (f"dZ{op['dz']:+g}  safe Z{op['safe_z']:g} "
+                                                         f"F{op['approach_feed']:g}")
                 elif kind == "rotate":
                     label = "ROTATE"; description = f"R{op['r']:.2f}° P{op['ptp_speed']:.2f}%"
                 elif kind == "text":
@@ -1195,7 +1323,7 @@ class MainWindow(QMainWindow):
                 if kind == "wait_input": it.setForeground(QColor("#f6a1a1"))
                 self.op_list.addItem(it)
                 try:
-                    current = endpoint(current, op, active_tool(self.project))
+                    current = display_endpoint(self.project, current, op, active_tool(self.project))
                 except ValueError:
                     pass
             self.op_list.setCurrentRow(0 if self.selected == -2 else
@@ -1213,10 +1341,13 @@ class MainWindow(QMainWindow):
                      + ("IGNOROVANO v CADu, ale runner stale kontroluje." if self.project.get('ignore_refill_warning') else "Zmensi F / zmen toleranci nebo zaskrtni Ignorovat."))
                      if windows else "\n\nHYRING: bez problemu v odhadu refill (nenahrazuje driver).")
         tool = active_tool(self.project)
-        self.warnings_view.setPlainText(
+        warning_text = (
             f"Nastroj: {tool['name']} | TCP kompenzace | "
             f"Kompenzace v CADu: {'ANO' if self.project['tcp_compensate'] else 'NE'}\n"
-            "BEZPECNOST: bez overeni konfigurace TCP v RHO4 nelze zarucit spravny pohyb.\n\n" +
+            "BEZPECNOST: bez overeni konfigurace TCP v RHO4 nelze zarucit spravny pohyb.\n"
+            + "Umisteni Sketch: " + " ".join(f"{k.upper()}={self.project['placement'][k]:g}"
+                                           for k in ('x','y','z','r'))
+            + " (rotace pouze XY kolem START; TCP R beze zmeny). Nejde o fyzicke nulovani.\n\n" +
             "OFFLINE kontrola (nenahrazuje kontrolu skutecneho robota).\n" +
             ("G0 na START je zapnute: offline kontrola NEZNA skutecnou vychozi polohu ani pristupovou drahu.\n\n"
              if self.project["move_to_start"] else
@@ -1224,9 +1355,15 @@ class MainWindow(QMainWindow):
             ("\n".join(("START" if i < 0 else f"Operace {i+1}") + ": " + e for i, e in errors)
              if errors else "Bez nalezenych chyb v dostupnem modelu drahy.\n\nPOZOR: kolize, realna konfigurace kloubu, pracovni nula a rychlosti nejsou overeny.") + refill_info)
         try:
-            self.gcode_preview.setPlainText(generate_gcode(self.project))
+            code = generate_gcode(self.project)
+            self.gcode_preview.setPlainText(code)
+            stats = analyze_gcode(code, machine_pose(transform_pose(self.project, pose(self.project["start"])), self.project),
+                                  unknown_initial_rapid=self.project["move_to_start"])
+            warning_text += "\n\n" + stats.as_text()
         except ValueError as exc:
             self.gcode_preview.setPlainText("; NELZE EXPORTOVAT\n; " + str(exc).replace("\n", "\n; "))
+            warning_text += "\n\nStatistika bude dostupna po vyreseni blokace exportu."
+        self.warnings_view.setPlainText(warning_text)
         self.tabs.setTabText(1, f"Kontrola ({len(errors)+len(windows)})")
         self._update_title()
 
@@ -1350,7 +1487,12 @@ class MainWindow(QMainWindow):
                      f"Kompenzace v CADu: {'ANO' if self.project['tcp_compensate'] else 'NE'}.\n"
                      "DULEZITE: RHO4 nesmi aplikovat stejny TCP offset podruhe. "
                      "Referencni ramec RHO4 jeste nebyl fyzicky overen.\n\n")
-        notes = (tool_note + "POZOR: export pouziva STROJNI souradnice. V runneru je nutne spustit s --machine-coordinates.\n\n"
+        placement = self.project["placement"]
+        place_note = (f"Umisteni celeho Sketch: X {placement['x']:+.3f}, Y {placement['y']:+.3f}, "
+                      f"Z {placement['z']:+.3f} mm, rotace {placement['r']:+.3f}°. "
+                      "Rotace kolem 00 START; R robota zustava beze zmeny. "
+                      "Skutecny referencni ramec RHO4 musi byt overen.\n\n")
+        notes = (tool_note + place_note + "POZOR: export pouziva STROJNI souradnice. V runneru je nutne spustit s --machine-coordinates.\n\n"
                  + start_warning +
                  "G0 = LINEAR, G100 = kloubovy PTP, G101 = rotace kolem A4. Pouzij AKTUALIZOVANY runner z tohoto balicku.\n"
                  "M3/M5 vyzaduji explicitni --arm-io a overene zapojeni vystupu!\n\n"
