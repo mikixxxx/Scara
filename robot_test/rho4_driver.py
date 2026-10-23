@@ -77,7 +77,7 @@ class Rho4:
 
     def __init__(
         self,
-        host="127.0.0.1",
+        host="192.168.4.1",
         port=6051,
         timeout=3.0
     ):
