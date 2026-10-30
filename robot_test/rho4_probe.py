@@ -130,7 +130,8 @@ def atomic_write_json(path: Path | str, data: dict) -> None:
             os.unlink(tmp)
 
 
-def assess_ready(driver, settings: dict, expected_x: float, expected_y: float):
+def assess_ready(driver, settings: dict, expected_x: float, expected_y: float,
+                 *, panel_ready_confirmed: bool = False):
     """Nonmoving validation before any command that can move the robot."""
     if not settings["probe"]["calibrated"]:
         raise ProbeError("Sonda neni kalibrovana; nastavit true az po overeni offsetu")
@@ -140,8 +141,21 @@ def assess_ready(driver, settings: dict, expected_x: float, expected_y: float):
     for key in ("alarm", "automatic", "referenced", "in_position"):
         if key not in status:
             raise ProbeError(f"Neni dostupny stav robota: {key}")
-    if status["alarm"] or not all(status[k] for k in ("automatic", "referenced", "in_position")):
-        raise ProbeError(f"Robot neni pripraven: {status}")
+    # The RHO4 PERMPROG maps referenced/in_position to physical inputs 129/128.
+    # Their meaning has NOT been independently verified for this SR6. Keep
+    # fail-closed by default; require a fresh, explicit operator confirmation
+    # of the RHO4 panel when either signal is false. Never waive ALARM/AUTO.
+    if status["alarm"] or status["automatic"] is not True:
+        raise ProbeError(f"Robot hlasi ALARM nebo neni v AUTO: {status}")
+    if not (status["referenced"] is True and status["in_position"] is True):
+        if not panel_ready_confirmed:
+            raise ProbeError(
+                "Vstupy referenced/in_position nejsou potvrzene: "
+                f"{status}. Pokud ovladaci panel potvrzuje referencovani "
+                "a pripravenost, pro JEDEN rucne kontrolovany probe "
+                "pouzij --panel-ready-confirmed. Neobchazi kontrolu "
+                "ALARM/AUTO, motion stavu ani sondy."
+            )
     state, error, proc = driver.get_move_state()
     if state not in (0, 2) or proc != -1 or error != 0:
         raise ProbeError(f"Motion neni v klidu: state={state}, error={error}, proc={proc}")
@@ -162,12 +176,16 @@ def assess_ready(driver, settings: dict, expected_x: float, expected_y: float):
 
 
 def probe_once(driver, settings: dict, *, start_x: float, start_y: float,
-               cad_surface_z: float, simulated: bool = False) -> dict:
+               cad_surface_z: float, simulated: bool = False,
+               panel_ready_confirmed: bool = False) -> dict:
     """One Z-only probe at the current XY; no XY repositioning or retract."""
     start_x = number(start_x, "start_x")
     start_y = number(start_y, "start_y")
     cad_surface_z = number(cad_surface_z, "cad_surface_z")
-    initial = assess_ready(driver, settings, start_x, start_y)
+    initial = assess_ready(
+        driver, settings, start_x, start_y,
+        panel_ready_confirmed=panel_ready_confirmed
+    )
     probe = settings["probe"]
     target_z = initial[2] + probe["approach_z_sign"] * probe["max_travel_mm"]
     if not 5.0 <= target_z <= 195.0:
@@ -222,7 +240,11 @@ def main(argv=None) -> int:
     p.add_argument("--start-y", type=float, required=True)
     p.add_argument("--cad-surface-z", type=float, required=True, help="Z povrchu ve vykresu v mm")
     p.add_argument("--confirm", required=True, help="Musi byt doslova PROBE")
-    p.add_argument("--simulator", action="store_true", help="Povolí localhost test, výsledek není platný pro robot")
+    p.add_argument("--simulator", action="store_true", help="Povoli localhost test, vysledek neni platny pro robot")
+    p.add_argument(
+        "--panel-ready-confirmed", action="store_true",
+        help="Obsluha prave overila pripravenost na panelu RHO4; pouze u nepotvrzenych stavovych vstupu 128/129"
+    )
     p.add_argument("--output", type=Path, default=Path("rho4_z_reference.json"))
     args = parser.parse_args(argv)
     try:
@@ -260,7 +282,8 @@ def main(argv=None) -> int:
                 print("Poloha priruby:", drv.get_position())
                 return 0
             result = probe_once(drv, settings, start_x=args.start_x, start_y=args.start_y,
-                                cad_surface_z=args.cad_surface_z, simulated=args.simulator)
+                                cad_surface_z=args.cad_surface_z, simulated=args.simulator,
+                                panel_ready_confirmed=args.panel_ready_confirmed)
             atomic_write_json(args.output, result)
             print(json.dumps(result, ensure_ascii=False, indent=2))
             print("HIT overen.")
